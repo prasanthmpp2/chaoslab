@@ -13,7 +13,7 @@ from app.core.exceptions import ValidationRejected
 
 
 class _P(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
 Direction = Literal["upstream", "downstream"]
