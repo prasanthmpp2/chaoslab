@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     execution_enabled: bool = False
     global_max_duration_seconds: int = 300
     max_request_bytes: int = 262_144
-    rate_limit_per_minute: int = 120
+    rate_limit_per_minute: int = 10_000
     max_output_bytes: int = 65_536
 
     # Auth: map of sha256(api_key) hex -> {user, roles}
