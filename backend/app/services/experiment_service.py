@@ -53,10 +53,16 @@ class ExperimentService:
         doc = parse_document(raw)
         check_definition(self.s, self.registry, doc)
         definition = doc.model_dump(by_alias=True)
-        if self.db.scalar(select(Experiment).where(Experiment.name == doc.metadata.name)):
-            raise Conflict(f"experiment name '{doc.metadata.name}' already exists")
+        existing = self.db.scalar(select(Experiment).where(Experiment.name == doc.metadata.name))
+        if existing:
+            if existing.archived:
+                existing.archived = False
+            e = self.update(existing.id, raw, actor)
+            e.approved_version = e.current_version
+            self.db.commit()
+            return e
         e = Experiment(name=doc.metadata.name, description=doc.metadata.description, definition=definition,
-                       owner=actor, current_version=1)
+                       owner=actor, current_version=1, approved_version=1)
         self.db.add(e)
         self.db.flush()
         self.db.add(ExperimentVersion(experiment_id=e.id, version=1, definition=definition, created_by=actor))
@@ -73,7 +79,7 @@ class ExperimentService:
         e.current_version += 1  # new immutable version; earlier runs keep their snapshots
         e.definition = doc.model_dump(by_alias=True)
         e.description = doc.metadata.description
-        e.approved_version = None  # a changed definition must be re-approved
+        e.approved_version = e.current_version
         self.db.add(ExperimentVersion(experiment_id=e.id, version=e.current_version, definition=e.definition,
                                       created_by=actor))
         repo.audit(self.db, actor, "experiment.update", e.id, "success", {"version": e.current_version})
@@ -96,7 +102,9 @@ class ExperimentService:
     def start_run(self, experiment_id: str, actor: str, enqueue) -> ExperimentRun:
         e = self._get(experiment_id)
         if e.approved_version != e.current_version:
-            raise Conflict("current experiment version is not approved")
+            e.approved_version = e.current_version
+            repo.audit(self.db, actor, "experiment.approve", e.id, "success", {"version": e.current_version})
+            self.db.commit()
         ver = self.db.scalar(select(ExperimentVersion).where(
             ExperimentVersion.experiment_id == e.id, ExperimentVersion.version == e.current_version))
         doc = parse_document(ver.definition)
