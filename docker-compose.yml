@@ -59,7 +59,7 @@ services:
     depends_on:
       migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
-    networks: [api-net, control-net, fault-mgmt]
+    networks: [api-net, control-net, fault-mgmt, app-net]
     volumes:
       - artifacts:/var/lib/chaos/artifacts
       - /var/run/docker.sock:/var/run/docker.sock

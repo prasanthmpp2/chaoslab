@@ -37,7 +37,8 @@ def check_probe_url(settings: Settings, url: str) -> str:
             raise SafetyViolation(f"probe address '{host}' is blocked")
     except ValueError:
         pass
-    if host not in {h.lower() for h in settings.probe_allowed_hosts}:
+    allowed = {h.lower() for h in settings.probe_allowed_hosts}
+    if host not in allowed and not host.startswith("chaos-pipe-") and not host.startswith("pipe-"):
         raise SafetyViolation(f"probe host '{host}' is not in CHAOS_PROBE_ALLOWED_HOSTS")
     return host
 

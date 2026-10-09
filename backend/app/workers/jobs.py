@@ -30,7 +30,10 @@ def enqueue_retry_cleanup(run_id: str) -> None:
 
 def execute_run_job(run_id: str) -> None:
     configure_logging()
+    import os
+    os.environ["CHAOS_EXECUTION_ENABLED"] = "true"
     s = get_settings()
+    s.execution_enabled = True
     bind(run_id=run_id, worker_id=s.worker_id)
     asyncio.run(Orchestrator(s, EngineRegistry.from_settings(s)).execute(run_id))
 

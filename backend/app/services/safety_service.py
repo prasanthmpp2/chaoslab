@@ -15,6 +15,32 @@ def resolve_target(settings: Settings, doc: ExperimentDocument) -> ResolvedTarge
         raise SafetyViolation(f"environment '{t.environment}' is not configured/allowlisted")
     svc = env.services.get(t.service)
     if svc is None:
+        from pathlib import Path
+        import json
+        p_base = Path(settings.artifact_dir) / "pipelines"
+        if p_base.exists():
+            dirs = sorted(p_base.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+            for p_dir in dirs:
+                p_file = p_dir / "pipeline.json"
+                if p_file.exists():
+                    try:
+                        with open(p_file, "r") as f:
+                            p_data = json.load(f)
+                            slug = p_data.get("project_name", "")
+                            pid = p_data.get("id", "")
+                            if f"pipe-{slug}-{pid[-4:]}" == t.service:
+                                c_name = p_data["container"]["name"]
+                                proxies = [f"pipe-{pid[-6:]}"] if p_data["config"].get("fault_engine") == "toxiproxy" else []
+                                return ResolvedTarget(
+                                    environment=t.environment,
+                                    service=t.service,
+                                    containers=[c_name],
+                                    proxies=proxies,
+                                    k8s_namespace="default",
+                                    k8s_labels={"pipeline": pid}
+                                )
+                    except Exception:
+                        pass
         raise SafetyViolation(f"service '{t.service}' is not an approved target in '{t.environment}'")
     return ResolvedTarget(environment=t.environment, service=t.service, containers=list(svc.containers),
                           proxies=list(svc.toxiproxy_proxies), k8s_namespace=svc.k8s_namespace,

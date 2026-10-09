@@ -14,3 +14,6 @@ export const useValidate=()=>useMutation({mutationFn:(id:string)=>api<{valid:boo
 export function useStartRun(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.Run>(`${V}/experiments/${id}/runs`,{method:'POST'}),onSuccess:()=>qc.invalidateQueries({queryKey:['runs']})})}
 export function useCancelRun(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.Run>(`${V}/runs/${id}/cancel`,{method:'POST'}),onSuccess:(_,id)=>qc.invalidateQueries({queryKey:['run',id]})})}
 export function useRetryCleanup(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.Run>(`${V}/runs/${id}/retry-cleanup`,{method:'POST'}),onSuccess:()=>{qc.invalidateQueries({queryKey:['faults']});qc.invalidateQueries({queryKey:['run']})}})}
+export const usePipelines=()=>useQuery({queryKey:['pipelines'],queryFn:({signal})=>api<any[]>(`${V}/pipeline`,{signal}),refetchInterval:3000});
+export const usePipeline=(id:string)=>useQuery({queryKey:['pipeline',id],queryFn:({signal})=>api<any>(`${V}/pipeline/${id}`,{signal}),enabled:!!id,refetchInterval:q=>{const s=q.state.data?.status;return(s==='QUEUED'||s==='RUNNING')?1500:false}});
+
