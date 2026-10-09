@@ -1,0 +1,18 @@
+# OPT-IN override for Pumba/Docker faults:  docker compose -f docker-compose.yml -f docker-compose.pumba.yml up -d
+# WARNING: mounting /var/run/docker.sock gives the worker effective root control of the Docker host.
+# Use only on a dedicated, disposable test host. This is NOT an isolation boundary.
+services:
+  worker:
+    environment:
+      CHAOS_DOCKER_ENABLED: "true"
+      # Set to "true" ONLY after you verified tc/NET_ADMIN (netem) and stress-ng prerequisites yourself.
+      CHAOS_PUMBA_PRIVILEGED_OK: "false"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"
+  reconciler:
+    environment:
+      CHAOS_DOCKER_ENABLED: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"

@@ -1,0 +1,42 @@
+# Environments
+.env
+.env.*
+!.env.example
+.venv
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build / Output
+dist/
+build/
+.next/
+out/
+coverage/
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+*.egg-info/
+.eggs/
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Chaos / Output logs
+*.log
+*.sqlite3
+db.sqlite3
