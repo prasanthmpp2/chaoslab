@@ -10,63 +10,73 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 
 from app.core.config import get_settings
 from app.core.security import Principal, Role, require
-from app.services.pipeline_service import PipelineService, get_pipeline, list_pipelines
+from app.services.pipeline_service import (
+    PipelineService,
+    download_github_repo,
+    get_pipeline,
+    list_pipelines,
+)
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 
 
-def _create_sample_zip(sample_type: str) -> tuple[bytes, int, str]:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        if sample_type == "python":
-            main_code = (
-                "from http.server import HTTPServer, BaseHTTPRequestHandler\n"
-                "import os\n\n"
-                "class Handler(BaseHTTPRequestHandler):\n"
-                "    def do_GET(self):\n"
-                "        self.send_response(200)\n"
-                "        self.send_header('Content-Type', 'application/json')\n"
-                "        self.end_headers()\n"
-                "        self.wfile.write(b'{\"status\": \"healthy\", \"service\": \"python-microservice\"}')\n\n"
-                "if __name__ == '__main__':\n"
-                "    port = int(os.environ.get('PORT', 8000))\n"
-                "    server = HTTPServer(('0.0.0.0', port), Handler)\n"
-                "    print(f'Listening on port {port}...')\n"
-                "    server.serve_forever()\n"
-            )
-            df_code = (
-                "FROM chaos-api:latest\n"
-                "WORKDIR /app\n"
-                "COPY main.py /app/main.py\n"
-                "ENV PORT=8000\n"
-                "EXPOSE 8000\n"
-                'CMD ["python", "main.py"]\n'
-            )
-            z.writestr("main.py", main_code)
-            z.writestr("Dockerfile", df_code)
-            return buf.getvalue(), 8000, "/"
-        else:
-            # Default Nginx static web app
-            html_code = (
-                "<!DOCTYPE html>\n"
-                "<html>\n"
-                "<head><title>ChaosLab Resilient Service</title></head>\n"
-                "<body style='font-family:sans-serif;background:#0f172a;color:#f8fafc;padding:40px;'>\n"
-                "  <h1>🚀 ChaosLab Target Service</h1>\n"
-                "  <p>Status: <span style='color:#22c55e;font-weight:bold;'>HEALTHY</span></p>\n"
-                "  <p>Automated Containerization &amp; Chaos Engineering Active</p>\n"
-                "</body>\n"
-                "</html>\n"
-            )
-            df_code = (
-                "FROM nginx:1.27-alpine\n"
-                "COPY index.html /usr/share/nginx/html/index.html\n"
-                "EXPOSE 80\n"
-                'CMD ["nginx", "-g", "daemon off;"]\n'
-            )
-            z.writestr("index.html", html_code)
-            z.writestr("Dockerfile", df_code)
-            return buf.getvalue(), 80, "/"
+@router.post("/github")
+async def run_github_pipeline(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    repo_url: str = Query(..., description="GitHub repository URL or owner/repo"),
+    branch: str = Query("", description="Optional branch or ref (default: HEAD)"),
+    token: str = Query("", description="Optional GitHub access token"),
+    project_name: str = Query("", description="Optional project name (defaults to repo name)"),
+    target_service: str = Query("", description="Optional target microservice to inject faults into"),
+    container_port: int = Query(80, description="Default service port if not specified in compose/dockerfile"),
+    health_path: str = Query("/", description="Readiness health check path"),
+    fault_engine: str = Query("pumba"),
+    fault_type: str = Query("container-pause"),
+    fault_duration: int = Query(15),
+    auto_cleanup: bool = Query(True),
+    max_error_rate: float = Query(0.10),
+    _: Principal = Depends(require(Role.OPERATOR)),
+):
+    """Clone a GitHub repository, discover and build containers for every microservice, and run chaos resilience tests."""
+    try:
+        archive_bytes, derived_repo = download_github_repo(repo_url=repo_url, branch=branch, token=token)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    p_name = project_name.strip() if project_name.strip() else derived_repo
+
+    config = {
+        "container_port": container_port,
+        "health_path": health_path,
+        "target_service": target_service.strip(),
+        "fault_engine": fault_engine,
+        "fault_type": fault_type,
+        "fault_duration": fault_duration,
+        "fault_params": {},
+        "auto_cleanup": auto_cleanup,
+        "max_error_rate": max_error_rate,
+        "repo_url": repo_url,
+        "branch": branch,
+    }
+
+    svc = PipelineService()
+    state = svc.create_pipeline(project_name=p_name, config=config)
+    pipeline_id = state["id"]
+
+    # Unpack and discover services
+    svc.unpack_archive(pipeline_id, archive_bytes)
+
+    # Launch execution asynchronously
+    background_tasks.add_task(svc.execute_pipeline, pipeline_id)
+
+    return {
+        "pipeline_id": pipeline_id,
+        "status": "QUEUED",
+        "project_name": state["project_name"],
+        "services_count": len(state.get("services", [])),
+        "message": f"Cloned GitHub repository '{derived_repo}' and initiated multi-service CI/CD Chaos Pipeline",
+    }
 
 
 @router.post("/upload")
@@ -74,6 +84,7 @@ async def upload_and_run(
     request: Request,
     background_tasks: BackgroundTasks,
     project_name: str = Query("my-service"),
+    target_service: str = Query(""),
     container_port: int = Query(80),
     health_path: str = Query("/"),
     fault_engine: str = Query("pumba"),
@@ -84,7 +95,7 @@ async def upload_and_run(
     max_error_rate: float = Query(0.10),
     _: Principal = Depends(require(Role.OPERATOR)),
 ):
-    """Upload project archive (zip/tar or JSON base64) and launch the automated containerization + chaos test pipeline."""
+    """Upload project repository archive (zip/tar) and launch multi-service containerization + chaos test pipeline."""
     content_type = request.headers.get("content-type", "")
     body = await request.body()
     parsed_params = {}
@@ -98,6 +109,7 @@ async def upload_and_run(
         try:
             payload = json.loads(body.decode("utf-8"))
             project_name = payload.get("project_name", project_name)
+            target_service = payload.get("target_service", target_service)
             container_port = payload.get("container_port", container_port)
             health_path = payload.get("health_path", health_path)
             fault_engine = payload.get("fault_engine", fault_engine)
@@ -123,11 +135,12 @@ async def upload_and_run(
         archive_bytes = body
 
     if not archive_bytes:
-        raise HTTPException(status_code=400, detail="Empty project payload received")
+        raise HTTPException(status_code=400, detail="Empty project archive payload received")
 
     config = {
         "container_port": container_port,
         "health_path": health_path,
+        "target_service": target_service.strip(),
         "fault_engine": fault_engine,
         "fault_type": fault_type,
         "fault_duration": fault_duration,
@@ -140,7 +153,7 @@ async def upload_and_run(
     state = svc.create_pipeline(project_name=project_name, config=config)
     pipeline_id = state["id"]
 
-    # Unpack synchronously
+    # Unpack and discover services
     svc.unpack_archive(pipeline_id, archive_bytes)
 
     # Launch execution asynchronously in background task
@@ -150,46 +163,8 @@ async def upload_and_run(
         "pipeline_id": pipeline_id,
         "status": "QUEUED",
         "project_name": state["project_name"],
-        "message": "Project unpacked and CI/CD Chaos Pipeline initiated",
-    }
-
-
-@router.post("/sample")
-async def run_sample_pipeline(
-    background_tasks: BackgroundTasks,
-    sample_type: str = Query("nginx", regex="^(nginx|python)$"),
-    fault_engine: str = Query("pumba"),
-    fault_type: str = Query("container-pause"),
-    fault_duration: int = Query(15),
-    auto_cleanup: bool = Query(True),
-    _: Principal = Depends(require(Role.OPERATOR)),
-):
-    """Launch an automated CI/CD pipeline run with a built-in sample microservice."""
-    archive_bytes, port, path = _create_sample_zip(sample_type)
-
-    config = {
-        "container_port": port,
-        "health_path": path,
-        "fault_engine": fault_engine,
-        "fault_type": fault_type,
-        "fault_duration": fault_duration,
-        "fault_params": {},
-        "auto_cleanup": auto_cleanup,
-        "max_error_rate": 0.10,
-    }
-
-    svc = PipelineService()
-    state = svc.create_pipeline(project_name=f"sample-{sample_type}", config=config)
-    pipeline_id = state["id"]
-
-    svc.unpack_archive(pipeline_id, archive_bytes)
-    background_tasks.add_task(svc.execute_pipeline, pipeline_id)
-
-    return {
-        "pipeline_id": pipeline_id,
-        "status": "QUEUED",
-        "project_name": state["project_name"],
-        "message": f"Sample '{sample_type}' project CI/CD Chaos Pipeline initiated",
+        "services_count": len(state.get("services", [])),
+        "message": f"Project unpacked ({len(state.get('services', []))} services detected) and CI/CD Chaos Pipeline initiated",
     }
 
 
@@ -202,7 +177,7 @@ def list_pipeline_runs(_: Principal = Depends(require(Role.VIEWER))):
 
 @router.get("/{pipeline_id}")
 def get_pipeline_details(pipeline_id: str, _: Principal = Depends(require(Role.VIEWER))):
-    """Retrieve real-time pipeline status, logs, stage progress, and chaos results."""
+    """Retrieve real-time pipeline status, multi-service topology, logs, and chaos results."""
     settings = get_settings()
     pipeline = get_pipeline(settings, pipeline_id)
     if not pipeline:
@@ -212,7 +187,7 @@ def get_pipeline_details(pipeline_id: str, _: Principal = Depends(require(Role.V
 
 @router.post("/{pipeline_id}/teardown")
 def teardown_pipeline_container(pipeline_id: str, _: Principal = Depends(require(Role.OPERATOR))):
-    """Stop and remove test container and proxies for a pipeline."""
+    """Stop and remove all test containers and proxies for a pipeline."""
     svc = PipelineService()
     ok = svc.teardown_pipeline(pipeline_id)
     if not ok:

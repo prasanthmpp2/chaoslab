@@ -28,13 +28,29 @@ def resolve_target(settings: Settings, doc: ExperimentDocument) -> ResolvedTarge
                             p_data = json.load(f)
                             slug = p_data.get("project_name", "")
                             pid = p_data.get("id", "")
+                            # Check primary container or any discovered service container in multi-service project
+                            target_container = None
                             if f"pipe-{slug}-{pid[-4:]}" == t.service:
-                                c_name = p_data["container"]["name"]
-                                proxies = [f"pipe-{pid[-6:]}"] if p_data["config"].get("fault_engine") == "toxiproxy" else []
+                                target_container = p_data.get("container", {}).get("name")
+                            
+                            if not target_container and "services" in p_data:
+                                for s_item in p_data["services"]:
+                                    s_name = s_item.get("name", "")
+                                    s_cname = s_item.get("container_name", "")
+                                    if t.service in (f"pipe-{slug}-{s_name}-{pid[-4:]}", f"pipe-{s_name}-{pid[-4:]}", s_cname):
+                                        target_container = s_cname
+                                        break
+                                    # Fallback if t.service matched base slug
+                                    if f"pipe-{slug}-{pid[-4:]}" == t.service:
+                                        target_container = s_cname
+                                        break
+                            
+                            if target_container:
+                                proxies = [f"pipe-{pid[-6:]}"] if p_data.get("config", {}).get("fault_engine") == "toxiproxy" else []
                                 return ResolvedTarget(
                                     environment=t.environment,
                                     service=t.service,
-                                    containers=[c_name],
+                                    containers=[target_container],
                                     proxies=proxies,
                                     k8s_namespace="default",
                                     k8s_labels={"pipeline": pid}

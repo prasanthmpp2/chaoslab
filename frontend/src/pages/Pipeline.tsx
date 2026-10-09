@@ -24,13 +24,20 @@ const FAULT_OPTIONS: Record<string, { label: string; types: { id: string; label:
 };
 
 export default function Pipeline() {
+  const [sourceType, setSourceType] = useState<'github' | 'upload'>('github');
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [projectName, setProjectName] = useState('order-service');
-  const [containerPort, setContainerPort] = useState(80);
-  const [healthPath, setHealthPath] = useState('/');
+
+  // Dynamic user inputs - NO static or test values
+  const [repoUrl, setRepoUrl] = useState('');
+  const [branch, setBranch] = useState('');
+  const [token, setToken] = useState('');
+  const [projectName, setProjectName] = useState('');
+  const [targetService, setTargetService] = useState('');
+  const [containerPort, setContainerPort] = useState<string>('');
+  const [healthPath, setHealthPath] = useState('');
   const [engine, setEngine] = useState('pumba');
   const [faultType, setFaultType] = useState('container-pause');
-  const [duration, setDuration] = useState(10);
+  const [duration, setDuration] = useState(15);
   const [maxErrorRate, setMaxErrorRate] = useState(10);
   const [autoCleanup, setAutoCleanup] = useState(true);
   const [file, setFile] = useState<File | null>(null);
@@ -39,65 +46,76 @@ export default function Pipeline() {
 
   const pipelines = usePipelines();
   const currentPipeline = usePipeline(selectedId || (pipelines.data?.[0]?.id ?? ''));
-
   const activeData = currentPipeline.data;
 
-  async function handleSampleRun(sampleType: 'nginx' | 'python') {
-    setSubmitting(true);
-    setSubmitErr(null);
-    try {
-      const res = await api<{ pipeline_id: string }>(
-        `/api/v1/pipeline/sample?sample_type=${sampleType}&fault_engine=${engine}&fault_type=${faultType}&fault_duration=${duration}&auto_cleanup=${autoCleanup}`,
-        { method: 'POST' }
-      );
-      setSelectedId(res.pipeline_id);
-      pipelines.refetch();
-    } catch (e: any) {
-      setSubmitErr(e.message || 'Failed to start sample pipeline');
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function handleUploadRun(e: React.FormEvent) {
+  async function handleLaunchPipeline(e: React.FormEvent) {
     e.preventDefault();
     setSubmitting(true);
     setSubmitErr(null);
 
     try {
-      let arrayBuffer: ArrayBuffer;
-      if (file) {
-        arrayBuffer = await file.arrayBuffer();
-      } else {
-        // Fallback: create minimal web app payload
-        const dummy = "<!DOCTYPE html><html><body><h1>Resilient Service</h1></body></html>";
-        arrayBuffer = new TextEncoder().encode(dummy).buffer;
-      }
-
-      const params = new URLSearchParams({
-        project_name: projectName,
-        container_port: String(containerPort),
-        health_path: healthPath,
-        fault_engine: engine,
-        fault_type: faultType,
-        fault_duration: String(duration),
-        auto_cleanup: String(autoCleanup),
-        max_error_rate: String(maxErrorRate / 100),
-      });
-
-      const res = await api<{ pipeline_id: string }>(
-        `/api/v1/pipeline/upload?${params.toString()}`,
-        {
-          method: 'POST',
-          body: arrayBuffer,
-          headers: { 'Content-Type': 'application/octet-stream' },
+      if (sourceType === 'github') {
+        if (!repoUrl.trim()) {
+          throw new Error('Please enter a GitHub repository URL or owner/repo');
         }
-      );
 
-      setSelectedId(res.pipeline_id);
-      pipelines.refetch();
+        const params = new URLSearchParams({
+          repo_url: repoUrl.trim(),
+          branch: branch.trim(),
+          token: token.trim(),
+          project_name: projectName.trim(),
+          target_service: targetService.trim(),
+          container_port: containerPort ? String(containerPort) : '80',
+          health_path: healthPath.trim() || '/',
+          fault_engine: engine,
+          fault_type: faultType,
+          fault_duration: String(duration),
+          auto_cleanup: String(autoCleanup),
+          max_error_rate: String(maxErrorRate / 100),
+        });
+
+        const res = await api<{ pipeline_id: string }>(
+          `/api/v1/pipeline/github?${params.toString()}`,
+          { method: 'POST' }
+        );
+
+        setSelectedId(res.pipeline_id);
+        pipelines.refetch();
+      } else {
+        // Upload mode
+        if (!file) {
+          throw new Error('Please select a project repository archive (.zip or .tar.gz)');
+        }
+
+        const arrayBuffer = await file.arrayBuffer();
+        const derivedName = projectName.trim() || file.name.replace(/\.(zip|tar|gz|tar\.gz)$/i, '');
+
+        const params = new URLSearchParams({
+          project_name: derivedName,
+          target_service: targetService.trim(),
+          container_port: containerPort ? String(containerPort) : '80',
+          health_path: healthPath.trim() || '/',
+          fault_engine: engine,
+          fault_type: faultType,
+          fault_duration: String(duration),
+          auto_cleanup: String(autoCleanup),
+          max_error_rate: String(maxErrorRate / 100),
+        });
+
+        const res = await api<{ pipeline_id: string }>(
+          `/api/v1/pipeline/upload?${params.toString()}`,
+          {
+            method: 'POST',
+            body: arrayBuffer,
+            headers: { 'Content-Type': 'application/octet-stream' },
+          }
+        );
+
+        setSelectedId(res.pipeline_id);
+        pipelines.refetch();
+      }
     } catch (err: any) {
-      setSubmitErr(err.message || 'Failed to upload and start pipeline');
+      setSubmitErr(err.message || 'Failed to start pipeline');
     } finally {
       setSubmitting(false);
     }
@@ -115,73 +133,110 @@ export default function Pipeline() {
 
   return (
     <div>
-      <h2>CI/CD Chaos Pipeline</h2>
+      <h2>CI/CD Multi-Service Chaos Pipeline</h2>
       <p className="sub">
-        Upload application projects, automatically build Docker containers, and test resilience under real chaos fault injection.
+        Build and containerize microservices across your repository in Docker, connect them in an isolated network, and execute automated chaos resilience tests.
       </p>
 
       <div className="g2">
         {/* Form Column */}
         <div className="card">
-          <h3 style={{ marginTop: 0 }}>🚀 Launch New Pipeline</h3>
+          <h3 style={{ marginTop: 0 }}>🚀 Configure &amp; Launch Pipeline</h3>
 
+          {/* Source Type Selector */}
           <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
             <button
               type="button"
-              className="btn s"
-              onClick={() => {
-                setProjectName('nginx-web-app');
-                setContainerPort(80);
-                setHealthPath('/');
-                handleSampleRun('nginx');
-              }}
-              disabled={submitting}
+              className={`btn ${sourceType === 'github' ? '' : 's'}`}
+              onClick={() => setSourceType('github')}
             >
-              ⚡ Quick Run (Nginx Service)
+              🌐 GitHub Repository
             </button>
             <button
               type="button"
-              className="btn s"
-              onClick={() => {
-                setProjectName('python-api');
-                setContainerPort(8000);
-                setHealthPath('/');
-                handleSampleRun('python');
-              }}
-              disabled={submitting}
+              className={`btn ${sourceType === 'upload' ? '' : 's'}`}
+              onClick={() => setSourceType('upload')}
             >
-              🐍 Quick Run (Python API)
+              📁 Upload Repository Archive
             </button>
           </div>
 
-          <form onSubmit={handleUploadRun}>
-            <label>Project Name</label>
-            <input
-              type="text"
-              value={projectName}
-              onChange={(e) => setProjectName(e.target.value)}
-              placeholder="e.g. order-service"
-              required
-            />
+          <form onSubmit={handleLaunchPipeline}>
+            {sourceType === 'github' ? (
+              <>
+                <label>GitHub Repository URL *</label>
+                <input
+                  type="text"
+                  value={repoUrl}
+                  onChange={(e) => setRepoUrl(e.target.value)}
+                  placeholder="https://github.com/organization/repository"
+                  required
+                />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '8px' }}>
+                  <div>
+                    <label>Branch or Ref</label>
+                    <input
+                      type="text"
+                      value={branch}
+                      onChange={(e) => setBranch(e.target.value)}
+                      placeholder="main (optional)"
+                    />
+                  </div>
+                  <div>
+                    <label>Personal Access Token</label>
+                    <input
+                      type="password"
+                      value={token}
+                      onChange={(e) => setToken(e.target.value)}
+                      placeholder="Optional (for private repos)"
+                    />
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <label>Repository Archive (.zip / .tar.gz) *</label>
+                <input
+                  type="file"
+                  accept=".zip,.tar,.gz,.tar.gz"
+                  onChange={(e) => setFile(e.target.files?.[0] || null)}
+                  required
+                />
+                <small style={{ color: 'var(--mu)', display: 'block', marginTop: '4px' }}>
+                  Select an archive containing your project. If it has a docker-compose.yml or multiple Dockerfiles, all services will be containerized.
+                </small>
+              </>
+            )}
 
-            <label>Project Source Archive (.zip / .tar.gz)</label>
-            <input
-              type="file"
-              accept=".zip,.tar,.gz,.tar.gz"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-            />
-            <small style={{ color: 'var(--mu)', display: 'block', marginTop: '4px' }}>
-              Upload source code with a Dockerfile, or let ChaosLab auto-generate one for static/Python projects.
-            </small>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '12px' }}>
+              <div>
+                <label>Project Name</label>
+                <input
+                  type="text"
+                  value={projectName}
+                  onChange={(e) => setProjectName(e.target.value)}
+                  placeholder="Leave blank to auto-detect"
+                />
+              </div>
+              <div>
+                <label>Target Microservice to Attack</label>
+                <input
+                  type="text"
+                  value={targetService}
+                  onChange={(e) => setTargetService(e.target.value)}
+                  placeholder="Optional: e.g. api, auth, web"
+                />
+              </div>
+            </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '8px' }}>
               <div>
-                <label>Container Port</label>
+                <label>Default Container Port</label>
                 <input
                   type="number"
                   value={containerPort}
-                  onChange={(e) => setContainerPort(Number(e.target.value))}
-                  required
+                  onChange={(e) => setContainerPort(e.target.value)}
+                  placeholder="Auto-detect or e.g. 80, 8000"
                 />
               </div>
               <div>
@@ -190,13 +245,12 @@ export default function Pipeline() {
                   type="text"
                   value={healthPath}
                   onChange={(e) => setHealthPath(e.target.value)}
-                  placeholder="/"
-                  required
+                  placeholder="Default /"
                 />
               </div>
             </div>
 
-            <label>Chaos Engine</label>
+            <label style={{ marginTop: '12px' }}>Chaos Engine</label>
             <select
               value={engine}
               onChange={(e) => {
@@ -255,7 +309,7 @@ export default function Pipeline() {
                   checked={autoCleanup}
                   onChange={(e) => setAutoCleanup(e.target.checked)}
                 />
-                Auto-remove test container &amp; proxies when complete
+                Auto-remove all service containers &amp; proxies when complete
               </label>
             </div>
 
@@ -267,7 +321,7 @@ export default function Pipeline() {
               disabled={submitting}
               style={{ width: '100%', marginTop: '16px' }}
             >
-              {submitting ? 'Containerizing & Testing...' : '🚀 Build & Run Chaos Pipeline'}
+              {submitting ? 'Cloning, Building & Testing...' : '🚀 Build & Test Multi-Service Pipeline'}
             </button>
           </form>
         </div>
@@ -313,6 +367,62 @@ export default function Pipeline() {
                 })}
               </div>
 
+              {/* Multi-Service Topology Card */}
+              {activeData.services && activeData.services.length > 0 && (
+                <div style={{ marginBottom: '16px', padding: '12px', borderRadius: '8px', border: '1px solid var(--bd)', background: 'var(--sf)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <b style={{ fontSize: '13px' }}>📦 Discovered Microservices ({activeData.services.length})</b>
+                    {activeData.services.some((s: any) => s.status === 'running') && (
+                      <button
+                        className="btn s"
+                        style={{ fontSize: '11px', padding: '2px 8px' }}
+                        onClick={() => handleTeardown(activeData.id)}
+                      >
+                        Stop All Containers
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {activeData.services.map((svc: any) => (
+                      <div
+                        key={svc.name}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          padding: '6px 10px',
+                          borderRadius: '6px',
+                          background: svc.primary ? 'rgba(99, 102, 241, 0.12)' : 'var(--bg)',
+                          border: svc.primary ? '1px solid var(--ac)' : '1px solid var(--bd)',
+                          fontSize: '12px',
+                        }}
+                      >
+                        <div>
+                          <b>{svc.name}</b> {svc.primary && <span style={{ color: 'var(--ac)', fontWeight: 600 }}>[🎯 Chaos Target]</span>}
+                          <span style={{ color: 'var(--mu)', marginLeft: '8px' }}>
+                            ({svc.build_path && svc.build_path !== '.' ? svc.build_path + '/' : ''}{svc.dockerfile || svc.image})
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ color: 'var(--mu)' }}>Port: {svc.port || 'N/A'}</span>
+                          <span
+                            style={{
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              fontSize: '11px',
+                              background: svc.status === 'running' ? 'var(--ok)' : svc.status === 'built' ? 'var(--run)' : 'var(--mu)',
+                              color: '#fff',
+                            }}
+                          >
+                            {svc.status}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Verdict Summary Card */}
               {activeData.verdict && (
                 <div
@@ -345,22 +455,6 @@ export default function Pipeline() {
                 </div>
               )}
 
-              {/* Container Details */}
-              <div style={{ fontSize: '12px', color: 'var(--mu)', marginBottom: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div>
-                  Container: <code>{activeData.container?.name || 'N/A'}</code> | Status: <b>{activeData.container?.status}</b>
-                </div>
-                {activeData.container?.status === 'running' && (
-                  <button
-                    className="btn s"
-                    style={{ fontSize: '11px', padding: '2px 8px' }}
-                    onClick={() => handleTeardown(activeData.id)}
-                  >
-                    Stop Container
-                  </button>
-                )}
-              </div>
-
               {/* Execution Console Logs */}
               <label>Build &amp; Test Execution Console</label>
               <div
@@ -385,7 +479,7 @@ export default function Pipeline() {
           ) : (
             <div className="card">
               <p style={{ color: 'var(--mu)', textAlign: 'center', margin: '40px 0' }}>
-                Select a pipeline or launch a new run to view real-time container build and chaos test logs.
+                Enter a GitHub repository or upload project archive to build microservices in Docker and run chaos tests.
               </p>
             </div>
           )}
@@ -408,6 +502,7 @@ export default function Pipeline() {
                 <tr>
                   <th>Pipeline ID</th>
                   <th>Project</th>
+                  <th>Services</th>
                   <th>Status</th>
                   <th>Chaos Engine</th>
                   <th>Created At</th>
@@ -422,6 +517,11 @@ export default function Pipeline() {
                       <code>{p.id}</code>
                     </td>
                     <td><b>{p.project_name}</b></td>
+                    <td>
+                      <span className="b mu">
+                        {p.services?.length ? `${p.services.length} services` : '1 service'}
+                      </span>
+                    </td>
                     <td>
                       <Badge status={p.status} />
                     </td>
@@ -457,4 +557,3 @@ export default function Pipeline() {
     </div>
   );
 }
-
