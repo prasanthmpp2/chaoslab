@@ -1,14 +1,14 @@
 # Unified ChaosLab Orchestration
 x-chaos-env: &chaos-env
-  env_file: chaos-platform-backend/.env
+  env_file: backend/.env
   environment:
-    CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in chaos-platform-backend/.env}@postgres:5432/chaos
+    CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in backend/.env}@postgres:5432/chaos
     CHAOS_REDIS_URL: redis://redis:6379/0
 
 services:
   frontend:
     build:
-      context: frontend/chaoslab
+      context: frontend
       args:
         VITE_API_BASE_URL: http://localhost:8000
         VITE_API_TOKEN: "IMBI9MwihUQjmWN3qvBlVvyRcW-IutrhlWZCpRVZlK8"
@@ -23,7 +23,7 @@ services:
     environment:
       POSTGRES_USER: chaos
       POSTGRES_DB: chaos
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in chaos-platform-backend/.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in backend/.env}
     volumes: [pgdata:/var/lib/postgresql/data]
     networks: [control-net]
     healthcheck:
@@ -40,7 +40,7 @@ services:
       retries: 10
 
   migrate:
-    build: chaos-platform-backend
+    build: backend
     <<: *chaos-env
     command: ["alembic", "upgrade", "head"]
     depends_on:
@@ -49,22 +49,24 @@ services:
     restart: "no"
 
   api:
-    build: chaos-platform-backend
+    build: backend
     <<: *chaos-env
     environment:
       CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
       CHAOS_REDIS_URL: redis://redis:6379/0
-      CHAOS_DOCKER_ENABLED: "false"
       CHAOS_TOXIPROXY_URL: ${CHAOS_TOXIPROXY_URL:-}
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
     networks: [api-net, control-net, fault-mgmt]
-    volumes: [artifacts:/var/lib/chaos/artifacts]
+    volumes:
+      - artifacts:/var/lib/chaos/artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"
 
   worker:
-    build: chaos-platform-backend
+    build: backend
     <<: *chaos-env
     environment:
       CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
@@ -74,10 +76,13 @@ services:
     depends_on:
       migrate: {condition: service_completed_successfully}
     networks: [control-net, fault-mgmt, app-net]
-    volumes: [artifacts:/var/lib/chaos/artifacts]
+    volumes:
+      - artifacts:/var/lib/chaos/artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"
 
   reconciler:
-    build: chaos-platform-backend
+    build: backend
     <<: *chaos-env
     environment:
       CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
@@ -86,7 +91,10 @@ services:
     depends_on:
       migrate: {condition: service_completed_successfully}
     networks: [control-net, fault-mgmt, app-net]
-    volumes: [artifacts:/var/lib/chaos/artifacts]
+    volumes:
+      - artifacts:/var/lib/chaos/artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"
 
   # ---- optional disposable test bed ----
   toxiproxy:
