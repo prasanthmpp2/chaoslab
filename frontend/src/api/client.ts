@@ -4,7 +4,7 @@ const MSG:Record<number,string>={401:'Your session has expired or credentials ar
 export async function api<T>(path:string,init:RequestInit&{json?:unknown}={}):Promise<T>{
  const ctl=new AbortController();const t=setTimeout(()=>ctl.abort(),15000);
  init.signal?.addEventListener('abort',()=>ctl.abort());
- const tok=import.meta.env.VITE_API_TOKEN as string|undefined;
+ const tok=(typeof localStorage!=='undefined'?localStorage.getItem('api_key'):null)||(import.meta.env.VITE_API_TOKEN as string|undefined);
  try{const r=await fetch(BASE+path,{...init,signal:ctl.signal,headers:{'Content-Type':'application/json',...(tok?{"X-API-Key": tok}:{}),...init.headers},body:init.json!==undefined?JSON.stringify(init.json):init.body});
   if(!r.ok){let d='';try{const b=await r.json();d=typeof b.detail==='string'?b.detail:b.message??''}catch{}
    throw new ApiError(r.status,d||MSG[r.status]||`Request failed (${r.status})`,r.headers.get('x-request-id')??undefined)}

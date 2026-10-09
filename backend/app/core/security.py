@@ -49,9 +49,44 @@ def authenticate(key: str | None, settings: Settings) -> Principal:
 
 
 _windows: dict[str, deque[float]] = defaultdict(deque)
+_redis_client = None
 
 
-def _rate_limit(user: str, limit: int) -> None:
+def _get_redis(redis_url: str):
+    global _redis_client
+    if _redis_client is None and redis_url:
+        try:
+            from redis import Redis
+            _redis_client = Redis.from_url(redis_url, socket_connect_timeout=1, socket_timeout=1)
+        except Exception:
+            _redis_client = False
+    return _redis_client if _redis_client is not False else None
+
+
+def _rate_limit_redis(user: str, limit: int, redis_url: str) -> bool:
+    r = _get_redis(redis_url)
+    if not r:
+        return False
+    try:
+        now = time.time()
+        key = f"ratelimit:{user}"
+        pipe = r.pipeline()
+        pipe.zremrangebyscore(key, 0, now - 60)
+        pipe.zcard(key)
+        pipe.zadd(key, {f"{now}_{time.monotonic()}": now})
+        pipe.expire(key, 65)
+        res = pipe.execute()
+        count = res[1]
+        if count >= limit:
+            raise RateLimited("Rate limit exceeded")
+        return True
+    except RateLimited:
+        raise
+    except Exception:
+        return False
+
+
+def _rate_limit_memory(user: str, limit: int) -> None:
     now = time.monotonic()
     w = _windows[user]
     while w and now - w[0] > 60:
@@ -59,6 +94,16 @@ def _rate_limit(user: str, limit: int) -> None:
     if len(w) >= limit:
         raise RateLimited("Rate limit exceeded")
     w.append(now)
+    if len(_windows) > 100:
+        for k in list(_windows.keys()):
+            if not _windows[k] or now - _windows[k][-1] > 60:
+                _windows.pop(k, None)
+
+
+def _rate_limit(user: str, limit: int, redis_url: str = "") -> None:
+    if redis_url and _rate_limit_redis(user, limit, redis_url):
+        return
+    _rate_limit_memory(user, limit)
 
 
 def current_principal(
@@ -67,7 +112,7 @@ def current_principal(
     settings: Settings = Depends(get_settings),
 ) -> Principal:
     p = authenticate(x_api_key, settings)
-    _rate_limit(p.user, settings.rate_limit_per_minute)
+    _rate_limit(p.user, settings.rate_limit_per_minute, settings.redis_url)
     request.state.principal = p
     return p
 

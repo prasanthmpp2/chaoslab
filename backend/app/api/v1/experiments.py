@@ -33,10 +33,13 @@ def create(definition: dict[str, Any] = Body(...), p: Principal = Depends(requir
 
 
 @router.get("", response_model=list[ExperimentOut])
-def list_experiments(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+def list_experiments(q: str | None = Query(default=None), limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
                      db: Session = Depends(get_db), _: Principal = Depends(require(Role.VIEWER))):
-    q = select(Experiment).where(Experiment.archived.is_(False)).order_by(Experiment.created_at.desc())
-    return list(db.scalars(q.limit(limit).offset(offset)))
+    query = select(Experiment).where(Experiment.archived.is_(False)).order_by(Experiment.created_at.desc())
+    if q and q.strip():
+        search = f"%{q.strip()}%"
+        query = query.where(Experiment.name.ilike(search) | Experiment.description.ilike(search))
+    return list(db.scalars(query.limit(limit).offset(offset)))
 
 
 @router.get("/{experiment_id}", response_model=ExperimentOut)

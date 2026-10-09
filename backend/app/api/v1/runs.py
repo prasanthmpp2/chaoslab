@@ -48,11 +48,17 @@ def _run(db: Session, run_id: str) -> ExperimentRun:
 
 
 @router.get("", response_model=list[RunOut])
-def list_runs(status: str | None = None, experiment_id: str | None = None, limit: int = Query(50, ge=1, le=200),
+def list_runs(status: list[str] | None = Query(default=None), experiment_id: str | None = None, limit: int = Query(50, ge=1, le=200),
               offset: int = Query(0, ge=0), db: Session = Depends(get_db), _: Principal = Depends(require(Role.VIEWER))):
     q = select(ExperimentRun).order_by(ExperimentRun.created_at.desc())
     if status:
-        q = q.where(ExperimentRun.status == status)
+        statuses = []
+        for s in status:
+            statuses.extend([item.strip() for item in s.split(",") if item.strip()])
+        if len(statuses) == 1:
+            q = q.where(ExperimentRun.status == statuses[0])
+        elif len(statuses) > 1:
+            q = q.where(ExperimentRun.status.in_(statuses))
     if experiment_id:
         q = q.where(ExperimentRun.experiment_id == experiment_id)
     return list(db.scalars(q.limit(limit).offset(offset)))

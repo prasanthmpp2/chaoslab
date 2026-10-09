@@ -4,6 +4,7 @@ WORKDIR /srv
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml ./
 COPY app ./app
+COPY tests ./tests
 COPY alembic.ini ./
 RUN pip install .
 # Optional: install a Pumba binary. Supply a URL you have verified for your platform, e.g.
