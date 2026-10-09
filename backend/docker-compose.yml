@@ -1,0 +1,121 @@
+# Networks keep traffic classes apart:
+#   api-net      : clients <-> API
+#   control-net  : API/worker/reconciler <-> postgres/redis
+#   fault-mgmt   : worker <-> Toxiproxy management API (internal, no host exposure)
+#   app-net      : test application + Toxiproxy data-plane (probe traffic)
+x-chaos-env: &chaos-env
+  env_file: .env
+  environment:
+    CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/chaos
+    CHAOS_REDIS_URL: redis://redis:6379/0
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: chaos
+      POSTGRES_DB: chaos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [control-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chaos"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    networks: [control-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    <<: *chaos-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [control-net]
+    restart: "no"
+
+  api:  # NO docker socket, NO Kubernetes credentials, docker disabled
+    build: .
+    <<: *chaos-env
+    environment:
+      CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
+      CHAOS_REDIS_URL: redis://redis:6379/0
+      CHAOS_DOCKER_ENABLED: "false"
+      CHAOS_TOXIPROXY_URL: ${CHAOS_TOXIPROXY_URL:-}
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    networks: [api-net, control-net, fault-mgmt]
+    volumes: [artifacts:/var/lib/chaos/artifacts]
+
+  worker:  # runs engine adapters; the only service that may ever get privileged access
+    build: .
+    <<: *chaos-env
+    environment:
+      CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
+      CHAOS_REDIS_URL: redis://redis:6379/0
+      CHAOS_WORKER_ID: worker-1
+    command: ["rq", "worker", "chaos", "--url", "redis://redis:6379/0", "--with-scheduler"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    networks: [control-net, fault-mgmt, app-net]
+    volumes: [artifacts:/var/lib/chaos/artifacts]
+
+  reconciler:
+    build: .
+    <<: *chaos-env
+    environment:
+      CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
+      CHAOS_REDIS_URL: redis://redis:6379/0
+    command: ["python", "-m", "app.workers.reconciler"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    networks: [control-net, fault-mgmt, app-net]
+    volumes: [artifacts:/var/lib/chaos/artifacts]
+
+  # ---- optional disposable test bed: docker compose --profile testbed up -d ----
+  toxiproxy:
+    profiles: [testbed]
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    networks:
+      fault-mgmt: {}
+      app-net: {}
+    # Management API (8474) is NOT published to the host. Limitation: it listens on every attached network,
+    # so containers on app-net can reach it too. Do not run untrusted workloads on app-net.
+
+  toxiproxy-init:
+    profiles: [testbed]
+    image: curlimages/curl:8.10.1
+    depends_on: [toxiproxy]
+    networks: [fault-mgmt]
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        until curl -sf http://toxiproxy:8474/version; do sleep 1; done;
+        curl -sf -X POST http://toxiproxy:8474/proxies
+        -d '{"name":"payment-http","listen":"0.0.0.0:8000","upstream":"payment-service:80","enabled":true}'
+        || curl -sf http://toxiproxy:8474/proxies/payment-http
+
+  payment-service:  # disposable stand-in application (nginx answering 200 on /)
+    profiles: [testbed]
+    image: nginx:1.27-alpine
+    container_name: payment-service
+    networks: [app-net]
+
+networks:
+  api-net: {}
+  control-net: {internal: true}
+  fault-mgmt: {internal: true}
+  app-net: {internal: true}
+
+volumes:
+  pgdata: {}
+  artifacts: {}

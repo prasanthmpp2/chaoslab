@@ -1,0 +1,10 @@
+import {useParams} from 'react-router-dom';import {useEngines,useRuns} from '../api/hooks';import {Badge,ErrorState,Loading,Table} from '../components/ui';
+const INFO:Record<string,string>={'chaos-toolkit':'Experiment definitions with hypotheses, probes, actions and rollbacks.','chaos_toolkit':'Experiment definitions with hypotheses, probes, actions and rollbacks.',pumba:'Container lifecycle faults, network impairment and resource stress. Needs access to the container runtime.',toxiproxy:'TCP proxy faults: latency, jitter, bandwidth limits and connection faults.','chaos-mesh':'Kubernetes-native chaos resources. Requires a compatible cluster with Chaos Mesh installed.','chaos_mesh':'Kubernetes-native chaos resources. Requires a compatible cluster with Chaos Mesh installed.'};
+export default function EnginePage(){const {name=''}=useParams();const e=useEngines(),r=useRuns('');if(e.isLoading)return <Loading/>;if(e.isError)return <ErrorState e={e.error}/>;
+ const normName=name.replace('-','_');
+ const x=e.data!.find(i=>i.name===name||i.name===normName||i.name===name.replace('_','-'));
+ const isConfigured=x?(x.configured??(x as any).enabled??false):false;
+ const isReachable=x?(x.reachable??(x as any).available??false):false;
+ const caps=x?.capabilities??[];
+ return <><h2>{name}</h2><p className="sub">{INFO[name]||INFO[normName]}</p><div className="card">{!x||!isConfigured?<p>{(normName==='chaos_mesh')?'Chaos Mesh is not configured for this environment.':'Not configured.'}</p>:<><span className={`b ${isReachable?'ok':'er'}`}>{isReachable?'Reachable':'Unreachable'}</span> {x.version&&`v${x.version}`}<p>Capabilities: {caps.join(', ')||'none reported'}</p></>}</div>
+ <div className="card"><h3>Recent runs</h3>{r.data&&<Table head={['Run','Target','Execution','Outcome','Cleanup']} rows={r.data.filter(i=>(i.definition_snapshot.spec.fault.engine||'').replace('-','_')===normName).map(i=>[i.id,i.definition_snapshot.spec.target.environment+':'+i.definition_snapshot.spec.target.service,<Badge v={i.status}/>,<Badge v={i.outcome}/>,<Badge v={i.cleanup_status} cleanup/>])}/>}</div></>}

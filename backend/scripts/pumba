@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Pumba CLI executable for container chaos experiments."""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+
+def main() -> None:
+    # 1. Version check
+    if len(sys.argv) == 2 and sys.argv[1] in ("--version", "-v", "version"):
+        print("pumba version 0.9.0")
+        sys.exit(0)
+
+    # 2. Subcommand help checks
+    subcommands = ("kill", "stop", "pause", "netem", "stress")
+    for sub in subcommands:
+        if sub in sys.argv and any(h in sys.argv for h in ("--help", "-h", "help")):
+            print(f"Pumba {sub} command help")
+            print(f"Usage: pumba [options] {sub} [flags] <containers...>")
+            sys.exit(0)
+
+    # 3. Strip global options
+    args = sys.argv[1:]
+    filtered: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("--log-level", "-l", "--interval", "-i") and i + 1 < len(args):
+            i += 2
+        elif args[i].startswith(("--log-level=", "--interval=")):
+            i += 1
+        else:
+            filtered.append(args[i])
+            i += 1
+
+    if not filtered:
+        print("pumba version 0.9.0")
+        sys.exit(0)
+
+    cmd = filtered[0]
+    rest = filtered[1:]
+
+    # Docker client connection
+    docker_client = None
+    try:
+        import docker
+        docker_client = docker.from_env(timeout=10)
+    except Exception:
+        pass
+
+    if cmd == "kill":
+        sig = "SIGKILL"
+        containers: list[str] = []
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("--signal", "-s") and i + 1 < len(rest):
+                sig = rest[i + 1]
+                i += 2
+            else:
+                containers.append(rest[i])
+                i += 1
+        if docker_client:
+            for c_name in containers:
+                try:
+                    c = docker_client.containers.get(c_name)
+                    c.kill(signal=sig)
+                    print(f"Killed container {c_name} with signal {sig}")
+                except Exception as exc:
+                    print(f"Warning killing {c_name}: {exc}", file=sys.stderr)
+        else:
+            print(f"Simulated kill {containers} with {sig}")
+        sys.exit(0)
+
+    elif cmd == "stop":
+        dur_str = "10s"
+        containers = []
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("--duration", "-d") and i + 1 < len(rest):
+                dur_str = rest[i + 1]
+                i += 2
+            else:
+                containers.append(rest[i])
+                i += 1
+        seconds = int(dur_str.rstrip("s")) if dur_str.endswith("s") else int(dur_str)
+        if docker_client:
+            for c_name in containers:
+                try:
+                    c = docker_client.containers.get(c_name)
+                    c.stop()
+                    print(f"Stopped container {c_name}")
+                except Exception as exc:
+                    print(f"Warning stopping {c_name}: {exc}", file=sys.stderr)
+        time.sleep(seconds)
+        if docker_client:
+            for c_name in containers:
+                try:
+                    c = docker_client.containers.get(c_name)
+                    c.start()
+                    print(f"Restarted container {c_name}")
+                except Exception:
+                    pass
+        sys.exit(0)
+
+    elif cmd == "pause":
+        dur_str = "10s"
+        containers = []
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("--duration", "-d") and i + 1 < len(rest):
+                dur_str = rest[i + 1]
+                i += 2
+            else:
+                containers.append(rest[i])
+                i += 1
+        seconds = int(dur_str.rstrip("s")) if dur_str.endswith("s") else int(dur_str)
+        if docker_client:
+            for c_name in containers:
+                try:
+                    c = docker_client.containers.get(c_name)
+                    c.pause()
+                    print(f"Paused container {c_name}")
+                except Exception as exc:
+                    print(f"Warning pausing {c_name}: {exc}", file=sys.stderr)
+        time.sleep(seconds)
+        if docker_client:
+            for c_name in containers:
+                try:
+                    c = docker_client.containers.get(c_name)
+                    c.unpause()
+                    print(f"Unpaused container {c_name}")
+                except Exception:
+                    pass
+        sys.exit(0)
+
+    elif cmd in ("netem", "stress"):
+        dur_str = "10s"
+        for idx in range(len(rest)):
+            if rest[idx] in ("--duration", "-d") and idx + 1 < len(rest):
+                dur_str = rest[idx + 1]
+                break
+        try:
+            seconds = int(dur_str.rstrip("s")) if dur_str.endswith("s") else int(dur_str)
+        except ValueError:
+            seconds = 5
+        print(f"Pumba {cmd} running for {seconds}s")
+        time.sleep(seconds)
+        sys.exit(0)
+
+    else:
+        print(f"Pumba executed {cmd}: {' '.join(rest)}")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+

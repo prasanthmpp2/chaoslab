@@ -1,0 +1,37 @@
+apiVersion: chaos.example.io/v1
+kind: Experiment
+metadata:
+  name: payment-latency-test
+  version: "1"
+  description: Add 500ms latency on the payment HTTP proxy and verify the service tolerates it.
+spec:
+  target:
+    environment: docker-test
+    service: payment-service
+  fault:
+    engine: toxiproxy
+    type: network-latency
+    parameters:
+      proxy: payment-http
+      direction: downstream
+      latencyMs: 500
+      jitterMs: 100
+    durationSeconds: 30
+  hypothesis:
+    maxErrorRate: 0.02
+    maxP95LatencyMs: 1500
+    requireRecovery: true
+  safety:
+    environmentAllowlist: [docker-test]
+    maxDurationSeconds: 60
+    abortOnErrorRate: 0.10
+  cleanup:
+    removeFaults: true
+    verifyRecovery: true
+  probes:
+    - name: payment-via-proxy
+      type: http
+      url: http://toxiproxy:8000/
+      expectStatus: 200
+      samples: 5
+      intervalSeconds: 1
