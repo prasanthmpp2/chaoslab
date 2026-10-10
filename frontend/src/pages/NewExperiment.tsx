@@ -54,7 +54,7 @@ export default function NewExperiment(){const [s,setS]=useState(0);const eng=use
      if(!andRun)return nav('/experiments');
      if(confirm(`Run now? This injects ${d.fault_type} into ${d.target} for ${d.duration_seconds} s.`)){
        const x=await run.mutateAsync(e.id);
-       nav(`/runs/${x.id}`);
+       nav(`/runs/${x.run_id}`);
      }
    }catch(e){setMsg((e as Error).message)}
  };

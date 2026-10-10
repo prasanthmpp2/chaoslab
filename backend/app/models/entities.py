@@ -158,3 +158,15 @@ class TargetLease(Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("experiment_runs.id"), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = _ts()
+
+
+class PipelineExecution(Base):
+    """Pipeline state is durable in PostgreSQL; source and build artifacts stay on disk/object storage."""
+
+    __tablename__ = "pipeline_executions"
+    __table_args__ = (Index("ix_pipeline_status_created", "status", "created_at"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    state: Mapped[dict] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = _ts()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

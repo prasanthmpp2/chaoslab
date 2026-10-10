@@ -11,9 +11,9 @@ export const useProbes=(id:string)=>useQuery({queryKey:['probes',id],queryFn:({s
 export const useActiveFaults=()=>useQuery({queryKey:['faults'],queryFn:({signal})=>api<T.Fault[]>(`${V}/faults/active`,{signal}),refetchInterval:10000});
 export function useCreateExperiment(){const qc=useQueryClient();return useMutation({mutationFn:(b:T.ExperimentCreateRequest)=>api<T.Experiment>(`${V}/experiments`,{method:'POST',json:b}),onSuccess:()=>qc.invalidateQueries({queryKey:['exps']})})}
 export const useValidate=()=>useMutation({mutationFn:(id:string)=>api<{valid:boolean;errors?:string[];blast_radius?:string}>(`${V}/experiments/${id}/validate`,{method:'POST'})});
-export function useStartRun(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.Run>(`${V}/experiments/${id}/runs`,{method:'POST'}),onSuccess:()=>qc.invalidateQueries({queryKey:['runs']})})}
+export function useStartRun(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.RunSubmission>(`${V}/experiments/${id}/runs`,{method:'POST'}),onSuccess:()=>qc.invalidateQueries({queryKey:['runs']})})}
 export function useCancelRun(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.Run>(`${V}/runs/${id}/cancel`,{method:'POST'}),onSuccess:(_,id)=>qc.invalidateQueries({queryKey:['run',id]})})}
 export function useRetryCleanup(){const qc=useQueryClient();return useMutation({mutationFn:(id:string)=>api<T.Run>(`${V}/runs/${id}/retry-cleanup`,{method:'POST'}),onSuccess:()=>{qc.invalidateQueries({queryKey:['faults']});qc.invalidateQueries({queryKey:['run']})}})}
 export const usePipelines=()=>useQuery({queryKey:['pipelines'],queryFn:({signal})=>api<any[]>(`${V}/pipeline`,{signal}),refetchInterval:3000});
-export const usePipeline=(id:string)=>useQuery({queryKey:['pipeline',id],queryFn:({signal})=>api<any>(`${V}/pipeline/${id}`,{signal}),enabled:!!id,refetchInterval:q=>{const s=q.state.data?.status;return(s==='QUEUED'||s==='RUNNING')?1500:false}});
+export const usePipeline=(id:string)=>useQuery({queryKey:['pipeline',id],queryFn:({signal})=>api<any>(`${V}/pipeline/${id}`,{signal}),enabled:!!id,refetchInterval:q=>{const s=q.state.data?.status;return(s==='QUEUED'||s==='RUNNING'||s==='TEARING_DOWN')?1500:false}});
 

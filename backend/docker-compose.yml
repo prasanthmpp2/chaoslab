@@ -52,7 +52,7 @@ services:
     depends_on:
       migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
-    networks: [api-net, control-net, fault-mgmt]
+    networks: [api-net, control-net]
     volumes: [artifacts:/var/lib/chaos/artifacts]
 
   worker:  # runs engine adapters; the only service that may ever get privileged access
@@ -67,6 +67,23 @@ services:
       migrate: {condition: service_completed_successfully}
     networks: [control-net, fault-mgmt, app-net]
     volumes: [artifacts:/var/lib/chaos/artifacts]
+
+  pipeline-worker:
+    build: .
+    <<: *chaos-env
+    environment:
+      CHAOS_DATABASE_URL: postgresql+psycopg://chaos:${POSTGRES_PASSWORD}@postgres:5432/chaos
+      CHAOS_REDIS_URL: redis://redis:6379/0
+      CHAOS_WORKER_ID: pipeline-worker-1
+      CHAOS_DOCKER_ENABLED: "true"
+    command: ["rq", "worker", "pipeline", "--url", "redis://redis:6379/0"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    networks: [control-net, fault-mgmt, app-net]
+    volumes:
+      - artifacts:/var/lib/chaos/artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: "0:0"
 
   reconciler:
     build: .
@@ -114,7 +131,7 @@ networks:
   api-net: {}
   control-net: {internal: true}
   fault-mgmt: {internal: true}
-  app-net: {internal: true}
+  app-net: {name: chaos_app-net, internal: true}
 
 volumes:
   pgdata: {}

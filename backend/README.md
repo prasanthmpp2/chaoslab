@@ -17,6 +17,7 @@ client ─► API (FastAPI, no docker/k8s access) ─► Postgres (experiments, 
                                      │                          Chaos Toolkit CLI | Kubernetes (Chaos Mesh CRDs)
 Reconciler (loop) ─► expired/orphaned faults, stale runs, unclaimed QUEUED runs
 ```
+Pipeline execution uses a separate `pipeline` RQ queue and worker. The API accepts and extracts bounded source archives, but waits for an approver with a different identity before enqueueing builds. Pipeline status is durable in PostgreSQL; source/build data is on the shared artifacts volume. Only the pipeline worker mounts the Docker socket in the root Compose setup; that access is effectively host root and must be limited to trusted projects and disposable hosts.
 * **State machine** (`app/schemas/run.py`): `VALIDATING → QUEUED → RUNNING_BASELINE → INJECTING → OBSERVING →
   CLEANING_UP → VERIFYING_RECOVERY → SUCCEEDED|FAILED|ABORTED|CLEANUP_FAILED` (+ `REJECTED`, `ABORTING`).
   Every transition is persisted as a `run_events` row. Execution **status**, experiment **outcome**

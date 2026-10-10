@@ -16,7 +16,7 @@ from app.models.base import utcnow
 from app.schemas.run import RunStatus
 from app.services import metrics
 from app.services.cleanup_service import reconcile_once
-from app.workers.jobs import enqueue_run, get_queue
+from app.workers.jobs import enqueue_run, get_queue, reconcile_pipeline_jobs
 
 log = get_logger("reconciler")
 
@@ -47,6 +47,7 @@ async def main() -> None:
         try:
             stats = await reconcile_once(s, registry)
             stats["requeued"] = requeue_abandoned_queued(s)
+            stats["pipeline_jobs_reconciled"] = reconcile_pipeline_jobs(s)
             try:
                 metrics.QUEUE_DEPTH.set(len(get_queue()))
             except Exception:  # noqa: BLE001

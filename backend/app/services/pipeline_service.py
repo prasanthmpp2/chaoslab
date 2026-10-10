@@ -4,6 +4,8 @@ builds Docker containers for each service, and executes chaos resilience tests.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import io
 import json
 import os
@@ -21,21 +23,33 @@ from typing import Any
 
 import httpx
 import yaml
+from sqlalchemy import select
 
-from app.core.config import ServiceTarget, Settings, get_settings
+from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.db.session import session_scope
 from app.engines.registry import EngineRegistry
-from app.models import ExperimentRun, ProbeResult, RunEvent
+from app.models import ExperimentRun, PipelineExecution, ProbeResult, RunEvent
 from app.schemas.experiment import ExperimentDocument
 from app.services.experiment_service import ExperimentService
 from app.workers.jobs import enqueue_run
 
 log = get_logger(__name__)
 
-# In-memory registry for fast polling of active pipelines
-_PIPELINES: dict[str, dict[str, Any]] = {}
 _NEXT_PROXY_PORT = 8100
+MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 250 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 10_000
+
+
+def _copy_with_limit(source, destination, remaining: int) -> int:
+    copied = 0
+    while chunk := source.read(min(1024 * 1024, remaining - copied + 1)):
+        copied += len(chunk)
+        if copied > remaining:
+            raise ValueError("archive exceeds extraction limits")
+        destination.write(chunk)
+    return copied
 
 
 def _utcnow_iso() -> str:
@@ -50,42 +64,35 @@ def _get_pipeline_dir(settings: Settings, pipeline_id: str) -> Path:
 
 def _save_pipeline_state(settings: Settings, state: dict[str, Any]) -> None:
     pipeline_id = state["id"]
-    _PIPELINES[pipeline_id] = state
-    p_dir = _get_pipeline_dir(settings, pipeline_id)
-    with open(p_dir / "pipeline.json", "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    if not re.fullmatch(r"pipe-[a-f0-9]{8}", pipeline_id):
+        raise ValueError("invalid pipeline id")
+    _get_pipeline_dir(settings, pipeline_id)
+    with session_scope() as db:
+        row = db.get(PipelineExecution, pipeline_id)
+        if row is None:
+            row = PipelineExecution(
+                id=pipeline_id,
+                status=state.get("status", "UNKNOWN"),
+                state=copy.deepcopy(state),
+            )
+            db.add(row)
+        else:
+            row.status = state.get("status", "UNKNOWN")
+            row.state = copy.deepcopy(state)
 
 
 def get_pipeline(settings: Settings, pipeline_id: str) -> dict[str, Any] | None:
-    if pipeline_id in _PIPELINES:
-        return _PIPELINES[pipeline_id]
-    p_file = Path(settings.artifact_dir) / "pipelines" / pipeline_id / "pipeline.json"
-    if p_file.exists():
-        try:
-            with open(p_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                _PIPELINES[pipeline_id] = data
-                return data
-        except Exception:
-            return None
-    return None
+    if not re.fullmatch(r"pipe-[a-f0-9]{8}", pipeline_id):
+        return None
+    with session_scope() as db:
+        row = db.get(PipelineExecution, pipeline_id)
+        return copy.deepcopy(row.state) if row else None
 
 
 def list_pipelines(settings: Settings) -> list[dict[str, Any]]:
-    results = list(_PIPELINES.values())
-    p_base = Path(settings.artifact_dir) / "pipelines"
-    if p_base.exists():
-        for d in p_base.iterdir():
-            if d.is_dir() and d.name not in _PIPELINES:
-                p_file = d / "pipeline.json"
-                if p_file.exists():
-                    try:
-                        with open(p_file, "r", encoding="utf-8") as f:
-                            results.append(json.load(f))
-                    except Exception:
-                        pass
-    results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return results
+    with session_scope() as db:
+        rows = db.scalars(select(PipelineExecution).order_by(PipelineExecution.created_at.desc())).all()
+        return [copy.deepcopy(row.state) for row in rows]
 
 
 def download_github_repo(repo_url: str, branch: str = "", token: str = "") -> tuple[bytes, str]:
@@ -121,7 +128,9 @@ def download_github_repo(repo_url: str, branch: str = "", token: str = "") -> tu
         try:
             req = urllib.request.Request(d_url, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
+                data = resp.read(MAX_ARCHIVE_BYTES + 1)
+                if len(data) > MAX_ARCHIVE_BYTES:
+                    raise ValueError(f"GitHub archive exceeds {MAX_ARCHIVE_BYTES} bytes")
                 if len(data) > 0:
                     return data, repo
         except Exception as e:
@@ -173,6 +182,13 @@ def discover_services(
                         b_ctx = build_info.get("context", ".")
                         build_dir = (work_dir / b_ctx).resolve()
                         df_name = build_info.get("dockerfile", "Dockerfile")
+                    if build_dir is not None:
+                        if not build_dir.is_relative_to(work_dir.resolve()):
+                            raise ValueError(f"Compose build context escapes project directory: {build_dir}")
+                        df_path = (build_dir / df_name).resolve()
+                        if not df_path.is_relative_to(build_dir):
+                            raise ValueError(f"Dockerfile escapes build context: {df_name}")
+                        df_name = df_path.relative_to(build_dir).as_posix()
                     elif image_info:
                         image_tag = image_info
                         is_prebuilt = True
@@ -221,6 +237,8 @@ def discover_services(
                         "status": "pending",
                         "primary": False,
                     })
+        except ValueError:
+            raise
         except Exception as e:
             log.warning(f"Error parsing compose file {compose_path}: {e}")
 
@@ -353,7 +371,6 @@ def _auto_generate_dockerfile_for_dir(target_dir: Path) -> None:
 class PipelineService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.s = settings or get_settings()
-        self.s.execution_enabled = True
 
     def _log(self, state: dict[str, Any], level: str, msg: str) -> None:
         entry = {
@@ -382,7 +399,7 @@ class PipelineService:
         config: dict[str, Any],
     ) -> dict[str, Any]:
         pipeline_id = f"pipe-{uuid.uuid4().hex[:8]}"
-        slug_name = "".join(c if c.isalnum() or c in ("-", "_") else "-" for c in project_name.lower()).strip("-")
+        slug_name = re.sub(r"[^a-z0-9_-]+", "-", project_name.lower()).strip("-")[:40]
         if not slug_name:
             slug_name = "project"
 
@@ -391,7 +408,7 @@ class PipelineService:
             "project_name": slug_name,
             "created_at": _utcnow_iso(),
             "updated_at": _utcnow_iso(),
-            "status": "QUEUED",
+            "status": "PENDING_APPROVAL",
             "current_stage": "Extracting Project Repository",
             "stages": [
                 {"id": "extract", "name": "Extract Source", "status": "pending", "started_at": None, "ended_at": None},
@@ -413,6 +430,7 @@ class PipelineService:
                 "max_error_rate": float(config.get("max_error_rate", 0.10)),
                 "repo_url": str(config.get("repo_url", "")),
                 "branch": str(config.get("branch", "")),
+                "requested_by": str(config.get("requested_by", "unknown")),
             },
             "services": [],
             "container": {
@@ -431,6 +449,8 @@ class PipelineService:
         return state
 
     def unpack_archive(self, pipeline_id: str, archive_bytes: bytes) -> Path:
+        if len(archive_bytes) > MAX_ARCHIVE_BYTES:
+            raise ValueError(f"archive exceeds {MAX_ARCHIVE_BYTES} bytes")
         state = get_pipeline(self.s, pipeline_id)
         if not state:
             raise ValueError(f"Pipeline {pipeline_id} not found")
@@ -446,19 +466,42 @@ class PipelineService:
         try:
             if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
                 with zipfile.ZipFile(io.BytesIO(archive_bytes)) as z:
-                    for member in z.infolist():
+                    members = z.infolist()
+                    if len(members) > MAX_ARCHIVE_ENTRIES or sum(m.file_size for m in members) > MAX_EXTRACTED_BYTES:
+                        raise ValueError("ZIP archive exceeds extraction limits")
+                    extracted_bytes = 0
+                    for member in members:
                         target = (work_dir / member.filename).resolve()
-                        if not str(target).startswith(str(work_dir.resolve())):
+                        if not target.is_relative_to(work_dir.resolve()):
                             raise ValueError(f"Zip slip path traversal detected: {member.filename}")
-                        z.extract(member, work_dir)
+                        if member.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with z.open(member) as src, target.open("wb") as dst:
+                            extracted_bytes += _copy_with_limit(src, dst, MAX_EXTRACTED_BYTES - extracted_bytes)
                 self._log(state, "info", "Extracted ZIP archive into workspace.")
             elif tarfile.is_tarfile(io.BytesIO(archive_bytes)):
                 with tarfile.open(fileobj=io.BytesIO(archive_bytes)) as t:
-                    for member in t.getmembers():
+                    members = t.getmembers()
+                    if len(members) > MAX_ARCHIVE_ENTRIES or sum(m.size for m in members) > MAX_EXTRACTED_BYTES:
+                        raise ValueError("TAR archive exceeds extraction limits")
+                    extracted_bytes = 0
+                    for member in members:
                         target = (work_dir / member.name).resolve()
-                        if not str(target).startswith(str(work_dir.resolve())):
+                        if not target.is_relative_to(work_dir.resolve()):
                             raise ValueError(f"Tar slip path traversal detected: {member.name}")
-                        t.extract(member, work_dir)
+                        if not (member.isdir() or member.isfile()):
+                            raise ValueError(f"Unsupported TAR entry type: {member.name}")
+                        if member.isdir():
+                            target.mkdir(parents=True, exist_ok=True)
+                        else:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            source = t.extractfile(member)
+                            if source is None:
+                                raise ValueError(f"Could not read TAR entry: {member.name}")
+                            with source, target.open("wb") as dst:
+                                extracted_bytes += _copy_with_limit(source, dst, MAX_EXTRACTED_BYTES - extracted_bytes)
                 self._log(state, "info", "Extracted TAR archive into workspace.")
             else:
                 (work_dir / "index.html").write_bytes(archive_bytes)
@@ -495,6 +538,9 @@ class PipelineService:
             self._log(state, "info", f"Primary chaos target service designated: '{primary['name']}'")
 
         except Exception as exc:
+            state["status"] = "FAILED"
+            state["error"] = f"{type(exc).__name__}: {exc}"[:500]
+            state["current_stage"] = "Source extraction failed"
             self._update_stage(state, "extract", "failed")
             self._log(state, "error", f"Extraction & service discovery failed: {exc}")
             raise
@@ -512,8 +558,15 @@ class PipelineService:
         state["status"] = "RUNNING"
         _save_pipeline_state(self.s, state)
 
-        import docker
-        docker_client = docker.from_env()
+        try:
+            import docker
+            docker_client = docker.from_env()
+        except Exception as exc:
+            state["status"] = "FAILED"
+            state["current_stage"] = "Pipeline worker could not connect to Docker"
+            state["error"] = f"{type(exc).__name__}: {exc}"[:500]
+            _save_pipeline_state(self.s, state)
+            return state
 
         work_dir = _get_pipeline_dir(self.s, pipeline_id) / "src"
         services = state.get("services", [])
@@ -543,6 +596,8 @@ class PipelineService:
         proxy_name = None
         proxy_port = None
         service_name = f"pipe-{state['project_name']}-{pipeline_id[-4:]}"
+        state["target_service_key"] = service_name
+        _save_pipeline_state(self.s, state)
 
         try:
             # ----------------------------------------------------
@@ -687,20 +742,6 @@ class PipelineService:
                 final_probe_url = f"http://toxiproxy:{proxy_port}{health_path}"
                 self._log(state, "info", f"Toxiproxy proxy active at {final_probe_url}")
 
-            # Register in Settings environment
-            self.s.environments.setdefault("docker-test", None)
-            if self.s.environments.get("docker-test"):
-                self.s.environments["docker-test"].services[service_name] = ServiceTarget(
-                    containers=[target_container],
-                    toxiproxy_proxies=target_proxies,
-                )
-
-            # Ensure host is allowed in probe hosts
-            if target_container not in self.s.probe_allowed_hosts:
-                self.s.probe_allowed_hosts.append(target_container)
-            if "toxiproxy" not in self.s.probe_allowed_hosts:
-                self.s.probe_allowed_hosts.append("toxiproxy")
-
             # ----------------------------------------------------
             # 5. EXECUTE CHAOS EXPERIMENT
             # ----------------------------------------------------
@@ -768,16 +809,27 @@ class PipelineService:
                 },
             }
 
+            normalized_definition = ExperimentDocument.model_validate(exp_doc).model_dump(by_alias=True)
+            definition_fingerprint = hashlib.sha256(
+                json.dumps(normalized_definition, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            state["experiment_definition_sha256"] = definition_fingerprint
+            _save_pipeline_state(self.s, state)
+
             registry = EngineRegistry.from_settings(self.s)
             with session_scope() as db:
                 exp_svc = ExperimentService(db, self.s, registry)
-                exp = exp_svc.create(exp_doc, actor="ci-cd-pipeline")
+                pipeline_author = f"pipeline:{pipeline_id}"
+                pipeline_approver = state.get("approved_by")
+                if not pipeline_approver:
+                    raise RuntimeError("pipeline has no recorded approver")
+                exp = exp_svc.create(exp_doc, actor=pipeline_author)
                 exp_id = exp.id
                 state["experiment_id"] = exp_id
                 _save_pipeline_state(self.s, state)
 
-                exp_svc.approve(exp_id, actor="ci-cd-pipeline")
-                run = exp_svc.start_run(exp_id, actor="ci-cd-pipeline", enqueue=enqueue_run)
+                exp_svc.approve(exp_id, actor=pipeline_approver)
+                run = exp_svc.start_run(exp_id, actor=pipeline_approver, enqueue=enqueue_run)
                 run_id = run.id
                 state["experiment_run_id"] = run_id
                 _save_pipeline_state(self.s, state)
@@ -843,7 +895,7 @@ class PipelineService:
                         elif p.phase == "recovery":
                             recovery_p95 = p.measurement
 
-            resilience_passed = run_status == "SUCCEEDED" and outcome in ("PASSED", "DRY_RUN")
+            resilience_passed = run_status == "SUCCEEDED" and outcome == "PASSED"
 
             state["verdict"] = {
                 "passed": resilience_passed,
@@ -860,13 +912,16 @@ class PipelineService:
                 "summary": (
                     f"Resilience test PASSED! Microservice '{primary_svc['name']}' sustained {fault_type} and recovered successfully within error tolerance."
                     if resilience_passed
+                    else "Pipeline completed in dry-run mode; no chaos fault was injected."
+                    if run_status == "SUCCEEDED" and outcome == "DRY_RUN"
                     else f"Resilience test FAILED: Target microservice '{primary_svc['name']}' encountered {during_err:.1%} errors during {fault_type} fault injection."
                 ),
             }
 
             self._log(state, "info", state["verdict"]["summary"])
-            self._update_stage(state, "verdict", "completed" if resilience_passed else "failed")
-            state["status"] = "PASSED" if resilience_passed else "FAILED"
+            dry_run = run_status == "SUCCEEDED" and outcome == "DRY_RUN"
+            self._update_stage(state, "verdict", "completed" if resilience_passed or dry_run else "failed")
+            state["status"] = "PASSED" if resilience_passed else "DRY_RUN" if dry_run else "FAILED"
             state["current_stage"] = "Pipeline Completed"
 
         except Exception as exc:
@@ -887,31 +942,40 @@ class PipelineService:
             # ----------------------------------------------------
             if auto_cleanup:
                 self._log(state, "info", f"Auto-cleanup enabled: stopping and removing all {len(services)} service container(s)...")
+                cleanup_errors: list[str] = []
+                failed_containers: set[str] = set()
                 for c in deployed_containers:
                     try:
                         c.stop(timeout=2)
                         c.remove(force=True)
                         self._log(state, "info", f"Removed container '{c.name}'")
                     except Exception as e:
-                        log.warning(f"Error removing container: {e}")
+                        failed_containers.add(c.name)
+                        cleanup_errors.append(f"container {c.name}: {type(e).__name__}: {e}")
+                        log.warning("pipeline container cleanup failed", extra={"error_category": "cleanup"})
 
                 for s in services:
-                    s["status"] = "removed"
+                    s["status"] = "cleanup_failed" if s.get("container_name") in failed_containers else "removed"
                     if not s.get("is_prebuilt"):
                         try:
                             docker_client.images.remove(s["image"], force=True)
                         except Exception:
                             pass
 
-                state["container"]["status"] = "removed"
+                state["container"]["status"] = "cleanup_failed" if failed_containers else "removed"
 
                 if proxy_name:
                     try:
                         async with httpx.AsyncClient(timeout=2.0) as client:
-                            await client.delete(f"http://toxiproxy:8474/proxies/{proxy_name}")
+                            response = await client.delete(f"http://toxiproxy:8474/proxies/{proxy_name}")
+                            if response.status_code not in (200, 204, 404):
+                                response.raise_for_status()
                         self._log(state, "info", f"Toxiproxy proxy '{proxy_name}' deleted.")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        cleanup_errors.append(f"proxy {proxy_name}: {type(e).__name__}: {e}")
+                if cleanup_errors:
+                    state["cleanup_errors"] = cleanup_errors
+                    state["status"] = "CLEANUP_FAILED"
             else:
                 self._log(state, "info", f"Auto-cleanup disabled: {len(deployed_containers)} service container(s) remain active on 'chaos_app-net'.")
 
@@ -933,6 +997,7 @@ class PipelineService:
         if not services and state.get("container", {}).get("name"):
             services = [{"container_name": state["container"]["name"]}]
 
+        failures: list[str] = []
         for s in services:
             c_name = s.get("container_name")
             if not c_name:
@@ -943,10 +1008,13 @@ class PipelineService:
                 c.remove(force=True)
                 s["status"] = "removed"
                 self._log(state, "info", f"Manually stopped and removed container '{c_name}'.")
-            except Exception:
-                pass
+            except docker.errors.NotFound:
+                s["status"] = "removed"
+            except Exception as exc:
+                s["status"] = "cleanup_failed"
+                failures.append(f"container {c_name}: {type(exc).__name__}: {exc}")
 
-        state["container"]["status"] = "removed"
+        state["container"]["status"] = "cleanup_failed" if failures else "removed"
 
         p_port = state["container"].get("proxy_port")
         if p_port:
@@ -956,8 +1024,13 @@ class PipelineService:
                 req = urllib.request.Request(f"http://toxiproxy:8474/proxies/{proxy_name}", method="DELETE")
                 urllib.request.urlopen(req, timeout=2)
                 self._log(state, "info", f"Manually removed Toxiproxy proxy '{proxy_name}'.")
-            except Exception:
-                pass
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    failures.append(f"proxy {proxy_name}: {exc}")
+            except Exception as exc:
+                failures.append(f"proxy {proxy_name}: {type(exc).__name__}: {exc}")
 
+        if failures:
+            state["cleanup_errors"] = failures
         _save_pipeline_state(self.s, state)
-        return True
+        return not failures

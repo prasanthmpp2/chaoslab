@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://chaos:chaos@postgres:5432/chaos"
     redis_url: str = "redis://redis:6379/0"
     queue_name: str = "chaos"
+    pipeline_queue_name: str = "pipeline"
     artifact_dir: str = "/var/lib/chaos/artifacts"
     worker_id: str = "worker-local"
 

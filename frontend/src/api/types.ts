@@ -53,6 +53,7 @@ export interface Run {
 }
 
 export interface ActionResponse { run_id: string; status: string; message: string }
+export interface RunSubmission { run_id: string; status: ExecutionStatus; dry_run: boolean }
 
 export interface RunEvent { id: number; event_type: string; message: string; details: any; created_at: string }
 export interface ProbeResult { id: number; probe_name: string; phase: string; measurement: number | null; tolerance: number | null; status: string; detail: any; created_at: string; evidence_ref: string | null }

@@ -11,28 +11,29 @@ A unified Chaos Engineering platform that provides one interface for managing re
 
 1. **Prerequisites**: Docker and Docker Compose must be installed.
 2. **Environment Setup**:
-   * Generate backend `.env` configuration from templates if not present:
+   * Generate backend `.env` configuration from the template if not present:
      ```bash
-     cp chaos-platform-backend/.env.example chaos-platform-backend/.env
+     cp backend/.env.example backend/.env
      ```
-   * Set `CHAOS_API_KEYS` in `chaos-platform-backend/.env`. (e.g. using `python chaos-platform-backend/scripts/make_api_key.py admin admin`).
-   * Add the generated API key to `docker-compose.yml` under `frontend` build arguments as `VITE_API_TOKEN`.
+   * Set `POSTGRES_PASSWORD` and hashed `CHAOS_API_KEYS` in `backend/.env`. Generate a key with `python backend/scripts/make_api_key.py <user> <role>` and hash it using the script's output. Keep the raw key in browser local storage; it is never embedded in the frontend build.
 3. **Start the Platform**:
    ```bash
-   # Start core services (API, Worker, Postgres, Redis, Frontend)
-   docker compose up --build -d
+   # Start core services (API, workers, Postgres, Redis, Frontend)
+   docker compose --env-file backend/.env up --build -d
 
    # Optional: Start testbed services (Toxiproxy, Dummy Payment Service)
-   docker compose --profile testbed up -d
+   docker compose --env-file backend/.env --profile testbed up -d
    ```
 4. **Accessing the UI**:
    * Open your browser and navigate to `http://localhost:3000`
 
 ## Components
 
-* `frontend/chaoslab`: Contains the Vite + React frontend application.
-* `chaos-platform-backend`: Contains the FastAPI application and worker code.
-* `docker-compose.yml`: Root compose file that links frontend, backend, testbed, and database services.
+* `frontend/`: Vite + React frontend application.
+* `backend/`: FastAPI application, RQ workers, and engine adapters.
+* `docker-compose.yml`: Root compose file for frontend, backend, database, workers, and optional testbed services.
+
+Pipeline submissions pause in `PENDING_APPROVAL`. A separate approver must approve before the pipeline worker builds uploaded source and starts the experiment. Pipeline state is stored in PostgreSQL; source/build artifacts are in the shared artifacts volume. The pipeline worker mounts the Docker socket, which grants host-level Docker control, so use only with trusted projects on a disposable development host.
 
 ## E2E Testing
 

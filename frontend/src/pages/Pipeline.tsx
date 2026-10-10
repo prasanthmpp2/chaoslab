@@ -62,7 +62,6 @@ export default function Pipeline() {
         const params = new URLSearchParams({
           repo_url: repoUrl.trim(),
           branch: branch.trim(),
-          token: token.trim(),
           project_name: projectName.trim(),
           target_service: targetService.trim(),
           container_port: containerPort ? String(containerPort) : '80',
@@ -76,7 +75,11 @@ export default function Pipeline() {
 
         const res = await api<{ pipeline_id: string }>(
           `/api/v1/pipeline/github?${params.toString()}`,
-          { method: 'POST' }
+          {
+            method: 'POST',
+            timeoutMs: 120_000,
+            headers: token.trim() ? { 'X-GitHub-Token': token.trim() } : undefined,
+          }
         );
 
         setSelectedId(res.pipeline_id);
@@ -106,6 +109,7 @@ export default function Pipeline() {
           `/api/v1/pipeline/upload?${params.toString()}`,
           {
             method: 'POST',
+            timeoutMs: 120_000,
             body: arrayBuffer,
             headers: { 'Content-Type': 'application/octet-stream' },
           }
@@ -128,6 +132,16 @@ export default function Pipeline() {
       pipelines.refetch();
     } catch (err: any) {
       alert(err.message || 'Teardown failed');
+    }
+  }
+
+  async function handleApprove(pipelineId: string) {
+    try {
+      await api(`/api/v1/pipeline/${pipelineId}/approve`, { method: 'POST' });
+      currentPipeline.refetch();
+      pipelines.refetch();
+    } catch (err: any) {
+      alert(err.message || 'Pipeline approval failed');
     }
   }
 
@@ -321,7 +335,7 @@ export default function Pipeline() {
               disabled={submitting}
               style={{ width: '100%', marginTop: '16px' }}
             >
-              {submitting ? 'Cloning, Building & Testing...' : '🚀 Build & Test Multi-Service Pipeline'}
+              {submitting ? 'Preparing source for approval...' : 'Submit Pipeline For Approval'}
             </button>
           </form>
         </div>
@@ -336,9 +350,21 @@ export default function Pipeline() {
                   <small style={{ color: 'var(--mu)' }}>Pipeline ID: {activeData.id}</small>
                 </div>
                 <div>
-                  <Badge status={activeData.status} />
+                  <Badge v={activeData.status} />
                 </div>
               </div>
+
+              {activeData.status === 'PENDING_APPROVAL' && (
+                <div style={{ padding: '12px', marginBottom: '16px', border: '1px solid var(--wn)', borderRadius: '8px' }}>
+                  <b>Approval required</b>
+                  <p style={{ margin: '6px 0 10px', fontSize: '13px' }}>
+                    An approver other than the requester must approve before source builds or chaos execution begin.
+                  </p>
+                  <button className="btn" onClick={() => handleApprove(activeData.id)}>
+                    Approve Pipeline &amp; Start
+                  </button>
+                </div>
+              )}
 
               {/* Stepper */}
               <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '16px' }}>
@@ -492,7 +518,7 @@ export default function Pipeline() {
         {pipelines.isLoading ? (
           <Loading />
         ) : pipelines.isError ? (
-          <ErrorState message="Could not load pipeline history" />
+          <ErrorState e={pipelines.error} />
         ) : !pipelines.data?.length ? (
           <p style={{ color: 'var(--mu)' }}>No pipeline runs yet. Start your first run above!</p>
         ) : (
@@ -523,7 +549,7 @@ export default function Pipeline() {
                       </span>
                     </td>
                     <td>
-                      <Badge status={p.status} />
+                      <Badge v={p.status} />
                     </td>
                     <td>
                       {p.config?.fault_engine} / {p.config?.fault_type}
@@ -532,7 +558,7 @@ export default function Pipeline() {
                     <td>
                       {p.verdict ? (
                         <span style={{ color: p.verdict.passed ? 'var(--ok)' : 'var(--er)', fontWeight: 600 }}>
-                          {p.verdict.passed ? 'PASSED' : 'FAILED'}
+                          {p.status === 'DRY_RUN' ? 'DRY RUN' : p.verdict.passed ? 'PASSED' : 'FAILED'}
                         </span>
                       ) : (
                         '-'

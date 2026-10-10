@@ -1,13 +1,12 @@
 import io
 import json
+import os
 import time
 import urllib.request
 import zipfile
 
 API = "http://127.0.0.1:8000/api/v1"
-HEADERS = {
-    "X-API-Key": "61ALqQzHWPLW6ic75iLRQJAs5xOztjk8xzKnr5JAOrU"
-}
+HEADERS = {}
 
 def make_project_zip():
     buf = io.BytesIO()
@@ -28,6 +27,11 @@ def make_project_zip():
     return buf.getvalue()
 
 def run_test():
+    api_key = os.environ.get("CHAOS_TEST_API_KEY")
+    approver_key = os.environ.get("CHAOS_TEST_APPROVER_API_KEY")
+    if not api_key or not approver_key:
+        raise SystemExit("Set CHAOS_TEST_API_KEY and CHAOS_TEST_APPROVER_API_KEY for separate pipeline requester and approver identities")
+    HEADERS["X-API-Key"] = api_key
     print("1. Preparing user project ZIP archive...")
     zip_bytes = make_project_zip()
     print(f"   Created project zip: {len(zip_bytes)} bytes")
@@ -55,6 +59,14 @@ def run_test():
         print(f"   Pipeline initiated: ID={res['pipeline_id']} Status={res['status']}")
         pipeline_id = res["pipeline_id"]
 
+    approve_req = urllib.request.Request(
+        f"{API}/pipeline/{pipeline_id}/approve",
+        headers={"X-API-Key": approver_key},
+        method="POST",
+    )
+    with urllib.request.urlopen(approve_req) as resp:
+        print(f"   Pipeline approved: {json.loads(resp.read())['status']}")
+
     print("3. Monitoring CI/CD pipeline stages and chaos test...")
     start_time = time.time()
     final_data = None
@@ -67,7 +79,7 @@ def run_test():
             stages_summary = " -> ".join(f"{s['name']}: {s['status']}" for s in data["stages"] if s["status"] != "pending")
             print(f"   [{elapsed}s] Pipeline Status: {data['status']} | Active: {data['current_stage']}")
             print(f"       Stages: {stages_summary}")
-            if data["status"] in ("PASSED", "FAILED"):
+            if data["status"] in ("PASSED", "FAILED", "DRY_RUN", "CLEANUP_FAILED", "TEARDOWN_FAILED"):
                 final_data = data
                 break
 

@@ -126,6 +126,15 @@ def require(*roles: Role):
     return dep
 
 
+def require_all(*roles: Role):
+    def dep(p: Principal = Depends(current_principal)) -> Principal:
+        if Role.ADMIN not in p.roles and not all(role in p.roles for role in roles):
+            raise Forbidden(f"Requires all roles: {', '.join(role.value for role in roles)}")
+        return p
+
+    return dep
+
+
 _SENSITIVE_KEY = re.compile(r"(pass(word)?|secret|token|api[-_]?key|authorization|credential|kubeconfig)", re.I)
 _TEXT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+)\S+"), r"\1[REDACTED]"),

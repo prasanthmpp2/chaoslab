@@ -1,8 +1,76 @@
-import {useState} from 'react';import {Link,useNavigate} from 'react-router-dom';import {useExperiments,useStartRun,useValidate} from '../api/hooks';import {Confirm,Empty,ErrorState,Loading,Table} from '../components/ui';
-export default function Experiments(){const [q,setQ]=useState('');const d=useExperiments(q),val=useValidate(),run=useStartRun(),nav=useNavigate();
- const go=async(id:string)=>{const v=await val.mutateAsync(id);if(!v.valid)return alert('Validation failed: '+(v.errors??[]).join(', '));const r=await run.mutateAsync(id);nav(`/runs/${r.id}`)};
- return <><h2>Experiments</h2><p className="sub">Saved experiment definitions.</p><p><Link className="btn" to="/experiments/new">Create Experiment</Link></p>
- <label htmlFor="q">Search by name</label><input id="q" value={q} onChange={e=>setQ(e.target.value)}/><br/><br/>
- {const items=(d.data||[]).filter(x=>!q||x.definition.metadata.name.toLowerCase().includes(q.toLowerCase())||(x.definition.metadata.description||'').toLowerCase().includes(q.toLowerCase()));
- return d.isLoading?<Loading/>:d.isError?<ErrorState e={d.error}/>:!items.length?<Empty>No experiments found. Create your first experiment to start testing recovery.</Empty>:
- <div className="card"><Table head={['Name','Engine','Target','Fault','Duration','Version','']} rows={items.map(x=>[x.definition.metadata.name,x.definition.spec.fault.engine,x.definition.spec.target.environment+':'+x.definition.spec.target.service,x.definition.spec.fault.type,x.definition.spec.fault.durationSeconds+' s','v'+x.current_version,<Confirm title={`Run ${x.definition.metadata.name}?`} text={`Injects ${x.definition.spec.fault.type} into ${x.definition.spec.target.environment}:${x.definition.spec.target.service} for ${x.definition.spec.fault.durationSeconds} s. The backend validates safety policies again before starting.`} action="Run experiment" onYes={()=>go(x.id).catch(e=>alert(e.message))}>Run</Confirm>])}/></div>}}</>}
+import { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useExperiments, useStartRun, useValidate } from '../api/hooks';
+import { Confirm, Empty, ErrorState, Loading, Table } from '../components/ui';
+
+export default function Experiments() {
+  const [query, setQuery] = useState('');
+  const experiments = useExperiments(query);
+  const validate = useValidate();
+  const startRun = useStartRun();
+  const navigate = useNavigate();
+
+  const visibleExperiments = (experiments.data ?? []).filter((experiment) => {
+    const name = experiment.definition.metadata.name.toLowerCase();
+    const description = (experiment.definition.metadata.description ?? '').toLowerCase();
+    const search = query.toLowerCase();
+    return !search || name.includes(search) || description.includes(search);
+  });
+
+  async function runExperiment(experimentId: string) {
+    const validation = await validate.mutateAsync(experimentId);
+    if (!validation.valid) {
+      window.alert('Experiment validation failed. Review the definition and safety settings.');
+      return;
+    }
+
+    const run = await startRun.mutateAsync(experimentId);
+    navigate(`/runs/${run.run_id}`);
+  }
+
+  if (experiments.isLoading) return <Loading />;
+  if (experiments.isError) return <ErrorState e={experiments.error} />;
+
+  return (
+    <>
+      <h2>Experiments</h2>
+      <p className="sub">Saved experiment definitions.</p>
+      <p><Link className="btn" to="/experiments/new">Create Experiment</Link></p>
+
+      <label htmlFor="experiment-search">Search by name or description</label>
+      <input
+        id="experiment-search"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+      />
+      <br /><br />
+
+      {visibleExperiments.length === 0 ? (
+        <Empty>No experiments found. Create your first experiment to start testing recovery.</Empty>
+      ) : (
+        <div className="card">
+          <Table
+            head={['Name', 'Engine', 'Target', 'Fault', 'Duration', 'Version', '']}
+            rows={visibleExperiments.map((experiment) => [
+              experiment.definition.metadata.name,
+              experiment.definition.spec.fault.engine,
+              `${experiment.definition.spec.target.environment}:${experiment.definition.spec.target.service}`,
+              experiment.definition.spec.fault.type,
+              `${experiment.definition.spec.fault.durationSeconds} s`,
+              `v${experiment.current_version}`,
+              <Confirm
+                key={experiment.id}
+                title={`Run ${experiment.definition.metadata.name}?`}
+                text={`This requests ${experiment.definition.spec.fault.type} on ${experiment.definition.spec.target.environment}:${experiment.definition.spec.target.service} for ${experiment.definition.spec.fault.durationSeconds} seconds. The backend rechecks safety policies before starting.`}
+                action="Run experiment"
+                onYes={() => runExperiment(experiment.id).catch((error: Error) => window.alert(error.message))}
+              >
+                Run
+              </Confirm>,
+            ])}
+          />
+        </div>
+      )}
+    </>
+  );
+}

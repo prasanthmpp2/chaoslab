@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import json
+import tarfile
 import zipfile
-from typing import Any
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
 from app.core.config import get_settings
+from app.core.exceptions import Conflict
 from app.core.security import Principal, Role, require
+from app.workers.jobs import enqueue_pipeline, enqueue_pipeline_teardown
 from app.services.pipeline_service import (
     PipelineService,
     download_github_repo,
@@ -18,15 +22,25 @@ from app.services.pipeline_service import (
 )
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+async def _read_upload_body(request: Request) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Project archive exceeds 50 MiB")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @router.post("/github")
 async def run_github_pipeline(
-    request: Request,
-    background_tasks: BackgroundTasks,
     repo_url: str = Query(..., description="GitHub repository URL or owner/repo"),
     branch: str = Query("", description="Optional branch or ref (default: HEAD)"),
-    token: str = Query("", description="Optional GitHub access token"),
+    github_token: str = Header("", alias="X-GitHub-Token", description="Optional GitHub access token"),
     project_name: str = Query("", description="Optional project name (defaults to repo name)"),
     target_service: str = Query("", description="Optional target microservice to inject faults into"),
     container_port: int = Query(80, description="Default service port if not specified in compose/dockerfile"),
@@ -36,11 +50,13 @@ async def run_github_pipeline(
     fault_duration: int = Query(15),
     auto_cleanup: bool = Query(True),
     max_error_rate: float = Query(0.10),
-    _: Principal = Depends(require(Role.OPERATOR)),
+    principal: Principal = Depends(require(Role.OPERATOR)),
 ):
     """Clone a GitHub repository, discover and build containers for every microservice, and run chaos resilience tests."""
     try:
-        archive_bytes, derived_repo = download_github_repo(repo_url=repo_url, branch=branch, token=token)
+        archive_bytes, derived_repo = await asyncio.to_thread(
+            download_github_repo, repo_url=repo_url, branch=branch, token=github_token
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -58,6 +74,7 @@ async def run_github_pipeline(
         "max_error_rate": max_error_rate,
         "repo_url": repo_url,
         "branch": branch,
+        "requested_by": principal.user,
     }
 
     svc = PipelineService()
@@ -65,14 +82,14 @@ async def run_github_pipeline(
     pipeline_id = state["id"]
 
     # Unpack and discover services
-    svc.unpack_archive(pipeline_id, archive_bytes)
-
-    # Launch execution asynchronously
-    background_tasks.add_task(svc.execute_pipeline, pipeline_id)
+    try:
+        svc.unpack_archive(pipeline_id, archive_bytes)
+    except (ValueError, zipfile.BadZipFile, tarfile.ReadError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid project archive") from exc
 
     return {
         "pipeline_id": pipeline_id,
-        "status": "QUEUED",
+        "status": "PENDING_APPROVAL",
         "project_name": state["project_name"],
         "services_count": len(state.get("services", [])),
         "message": f"Cloned GitHub repository '{derived_repo}' and initiated multi-service CI/CD Chaos Pipeline",
@@ -82,7 +99,6 @@ async def run_github_pipeline(
 @router.post("/upload")
 async def upload_and_run(
     request: Request,
-    background_tasks: BackgroundTasks,
     project_name: str = Query("my-service"),
     target_service: str = Query(""),
     container_port: int = Query(80),
@@ -93,11 +109,11 @@ async def upload_and_run(
     fault_params: str = Query("{}"),
     auto_cleanup: bool = Query(True),
     max_error_rate: float = Query(0.10),
-    _: Principal = Depends(require(Role.OPERATOR)),
+    principal: Principal = Depends(require(Role.OPERATOR)),
 ):
     """Upload project repository archive (zip/tar) and launch multi-service containerization + chaos test pipeline."""
     content_type = request.headers.get("content-type", "")
-    body = await request.body()
+    body = await _read_upload_body(request)
     parsed_params = {}
     try:
         parsed_params = json.loads(fault_params) if fault_params else {}
@@ -136,6 +152,8 @@ async def upload_and_run(
 
     if not archive_bytes:
         raise HTTPException(status_code=400, detail="Empty project archive payload received")
+    if len(archive_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Project archive exceeds 50 MiB")
 
     config = {
         "container_port": container_port,
@@ -147,25 +165,52 @@ async def upload_and_run(
         "fault_params": parsed_params,
         "auto_cleanup": auto_cleanup,
         "max_error_rate": max_error_rate,
+        "requested_by": principal.user,
     }
 
     svc = PipelineService()
     state = svc.create_pipeline(project_name=project_name, config=config)
     pipeline_id = state["id"]
 
-    # Unpack and discover services
-    svc.unpack_archive(pipeline_id, archive_bytes)
-
-    # Launch execution asynchronously in background task
-    background_tasks.add_task(svc.execute_pipeline, pipeline_id)
+    try:
+        svc.unpack_archive(pipeline_id, archive_bytes)
+    except (ValueError, zipfile.BadZipFile, tarfile.ReadError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid project archive") from exc
 
     return {
         "pipeline_id": pipeline_id,
-        "status": "QUEUED",
+        "status": "PENDING_APPROVAL",
         "project_name": state["project_name"],
         "services_count": len(state.get("services", [])),
         "message": f"Project unpacked ({len(state.get('services', []))} services detected) and CI/CD Chaos Pipeline initiated",
     }
+
+
+@router.post("/{pipeline_id}/approve", status_code=status.HTTP_202_ACCEPTED)
+def approve_pipeline(pipeline_id: str, principal: Principal = Depends(require(Role.APPROVER))):
+    settings = get_settings()
+    pipeline = get_pipeline(settings, pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.get("status") != "PENDING_APPROVAL":
+        raise Conflict("pipeline is not waiting for approval")
+    if pipeline.get("config", {}).get("requested_by") == principal.user:
+        raise Conflict("pipeline must be approved by someone other than its requester")
+
+    pipeline["approved_by"] = principal.user
+    pipeline["status"] = "QUEUED"
+    pipeline["current_stage"] = "Pipeline approved and queued"
+    from app.services.pipeline_service import _save_pipeline_state
+
+    _save_pipeline_state(settings, pipeline)
+    try:
+        enqueue_pipeline(pipeline_id)
+    except Exception as exc:
+        pipeline["status"] = "QUEUED"
+        pipeline["error"] = "Pipeline queue unavailable"
+        _save_pipeline_state(settings, pipeline)
+        raise HTTPException(status_code=503, detail="Pipeline queue unavailable") from exc
+    return {"pipeline_id": pipeline_id, "status": pipeline["status"]}
 
 
 @router.get("")
@@ -185,11 +230,26 @@ def get_pipeline_details(pipeline_id: str, _: Principal = Depends(require(Role.V
     return pipeline
 
 
-@router.post("/{pipeline_id}/teardown")
+@router.post("/{pipeline_id}/teardown", status_code=status.HTTP_202_ACCEPTED)
 def teardown_pipeline_container(pipeline_id: str, _: Principal = Depends(require(Role.OPERATOR))):
-    """Stop and remove all test containers and proxies for a pipeline."""
-    svc = PipelineService()
-    ok = svc.teardown_pipeline(pipeline_id)
-    if not ok:
+    """Queue cleanup of test containers and proxies for a pipeline."""
+    settings = get_settings()
+    pipeline = get_pipeline(settings, pipeline_id)
+    if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
-    return {"pipeline_id": pipeline_id, "status": "teardown_completed"}
+    if pipeline.get("status") == "TEARING_DOWN":
+        return {"pipeline_id": pipeline_id, "status": "teardown_queued"}
+    pipeline["status"] = "TEARING_DOWN"
+    pipeline["current_stage"] = "Pipeline teardown queued"
+    pipeline["updated_at"] = datetime.now(timezone.utc).isoformat()
+    from app.services.pipeline_service import _save_pipeline_state
+
+    _save_pipeline_state(settings, pipeline)
+    try:
+        enqueue_pipeline_teardown(pipeline_id)
+    except Exception as exc:
+        pipeline["status"] = "TEARDOWN_FAILED"
+        pipeline["error"] = "Pipeline queue unavailable"
+        _save_pipeline_state(settings, pipeline)
+        raise HTTPException(status_code=503, detail="Pipeline queue unavailable") from exc
+    return {"pipeline_id": pipeline_id, "status": "teardown_queued"}
