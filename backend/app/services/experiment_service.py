@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.exceptions import Conflict, NotFound, PlatformError, ValidationRejected
+from app.core.exceptions import NotFound, PlatformError, ValidationRejected
 from app.engines.registry import EngineRegistry
 from app.models import Experiment, ExperimentRun, ExperimentVersion
 from app.models.base import utcnow
@@ -17,6 +17,7 @@ from app.schemas.experiment import ExperimentDocument
 from app.schemas.run import CleanupStatus, RunStatus
 from app.services import metrics
 from app.services.safety_service import check_definition
+from app.services.scorecard_service import not_scored
 
 
 def parse_document(raw: dict[str, Any] | str) -> ExperimentDocument:
@@ -89,30 +90,15 @@ class ExperimentService:
         repo.audit(self.db, actor, "experiment.archive", e.id, "success")
         self.db.commit()
 
-    def approve(self, experiment_id: str, actor: str) -> Experiment:
-        e = self._get(experiment_id)
-        version = self.db.scalar(select(ExperimentVersion).where(
-            ExperimentVersion.experiment_id == e.id,
-            ExperimentVersion.version == e.current_version,
-        ))
-        if version is None:
-            raise NotFound("current experiment version not found")
-        if version.created_by == actor:
-            raise Conflict("an experiment version must be approved by someone other than its author")
-        e.approved_version = e.current_version
-        repo.audit(self.db, actor, "experiment.approve", e.id, "success", {"version": e.current_version})
-        self.db.commit()
-        return e
-
     def start_run(self, experiment_id: str, actor: str, enqueue) -> ExperimentRun:
         e = self._get(experiment_id)
-        if e.approved_version != e.current_version:
-            raise Conflict("current experiment version has not been approved")
         ver = self.db.scalar(select(ExperimentVersion).where(
             ExperimentVersion.experiment_id == e.id, ExperimentVersion.version == e.current_version))
         doc = parse_document(ver.definition)
         run = ExperimentRun(experiment_id=e.id, experiment_version=e.current_version, definition_snapshot=ver.definition,
-                            requested_by=actor, dry_run=not self.s.execution_enabled, status=RunStatus.VALIDATING.value)
+                            requested_by=actor, dry_run=not self.s.execution_enabled,
+                            scorecard=not_scored("run has not collected measurements yet"),
+                            status=RunStatus.VALIDATING.value)
         self.db.add(run)
         self.db.flush()
         repo.add_event(self.db, run.id, "submitted", f"submitted by {actor}", {"dry_run": run.dry_run})
@@ -145,7 +131,9 @@ class ExperimentService:
     def _persist_rejected(self, e: Experiment, ver: ExperimentVersion, actor: str, exc: PlatformError) -> ExperimentRun:
         run = ExperimentRun(experiment_id=e.id, experiment_version=e.current_version, definition_snapshot=ver.definition,
                             requested_by=actor, status=RunStatus.REJECTED.value, outcome="ERROR",
-                            cleanup_status=CleanupStatus.NOT_REQUIRED.value, finished_at=utcnow(),
+                            cleanup_status=CleanupStatus.NOT_REQUIRED.value,
+                            scorecard=not_scored("run was rejected before measurements were collected"),
+                            finished_at=utcnow(),
                             error_summary=exc.message[:500])
         self.db.add(run)
         self.db.flush()

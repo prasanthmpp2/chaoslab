@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { usePipelines, usePipeline } from '../api/hooks';
 import { api } from '../api/client';
 import { Badge, Loading, ErrorState } from '../components/ui';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
 const FAULT_OPTIONS: Record<string, { label: string; types: { id: string; label: string; defaultParams: any }[] }> = {
   pumba: {
@@ -24,6 +24,7 @@ const FAULT_OPTIONS: Record<string, { label: string; types: { id: string; label:
 };
 
 export default function Pipeline() {
+  const navigate = useNavigate();
   const [sourceType, setSourceType] = useState<'github' | 'upload'>('github');
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
@@ -50,6 +51,16 @@ export default function Pipeline() {
 
   async function handleLaunchPipeline(e: React.FormEvent) {
     e.preventDefault();
+    if (sourceType === 'github' && !repoUrl.trim()) {
+      setSubmitErr('Please enter a GitHub repository URL or owner/repo');
+      return;
+    }
+    if (sourceType === 'upload' && !file) {
+      setSubmitErr('Please select a project repository archive (.zip or .tar.gz)');
+      return;
+    }
+    const source = sourceType === 'github' ? repoUrl.trim() : file?.name;
+    if (!window.confirm(`Build containers for ${source} and run the configured ${faultType} chaos test for ${duration} seconds? This may interrupt the selected target service.`)) return;
     setSubmitting(true);
     setSubmitErr(null);
 
@@ -135,13 +146,14 @@ export default function Pipeline() {
     }
   }
 
-  async function handleApprove(pipelineId: string) {
+  async function handleStart(pipelineId: string) {
+    if (!window.confirm('Start building this project’s containers and run its configured chaos test?')) return;
     try {
-      await api(`/api/v1/pipeline/${pipelineId}/approve`, { method: 'POST' });
+      await api(`/api/v1/pipeline/${pipelineId}/start`, { method: 'POST' });
       currentPipeline.refetch();
       pipelines.refetch();
     } catch (err: any) {
-      alert(err.message || 'Pipeline approval failed');
+      alert(err.message || 'Pipeline could not be started');
     }
   }
 
@@ -335,7 +347,7 @@ export default function Pipeline() {
               disabled={submitting}
               style={{ width: '100%', marginTop: '16px' }}
             >
-              {submitting ? 'Preparing source for approval...' : 'Submit Pipeline For Approval'}
+              {submitting ? 'Preparing and starting pipeline…' : 'Build Containers & Run Pipeline'}
             </button>
           </form>
         </div>
@@ -356,12 +368,12 @@ export default function Pipeline() {
 
               {activeData.status === 'PENDING_APPROVAL' && (
                 <div style={{ padding: '12px', marginBottom: '16px', border: '1px solid var(--wn)', borderRadius: '8px' }}>
-                  <b>Approval required</b>
+                  <b>Ready to start</b>
                   <p style={{ margin: '6px 0 10px', fontSize: '13px' }}>
-                    An approver other than the requester must approve before source builds or chaos execution begin.
+                    Confirm to build the project containers and run the configured chaos test.
                   </p>
-                  <button className="btn" onClick={() => handleApprove(activeData.id)}>
-                    Approve Pipeline &amp; Start
+                  <button className="btn" onClick={() => handleStart(activeData.id)}>
+                    Build Containers &amp; Start
                   </button>
                 </div>
               )}
@@ -466,9 +478,9 @@ export default function Pipeline() {
                   <p style={{ margin: '6px 0 0', fontSize: '13px' }}>{activeData.verdict.summary}</p>
 
                   <div style={{ display: 'flex', gap: '16px', marginTop: '10px', fontSize: '12px' }}>
-                    <span>Baseline: <b>{(activeData.verdict.baseline_error_rate * 100).toFixed(1)}% err</b></span>
-                    <span>During Chaos: <b>{(activeData.verdict.during_error_rate * 100).toFixed(1)}% err</b></span>
-                    <span>Recovery: <b>{(activeData.verdict.recovery_error_rate * 100).toFixed(1)}% err</b></span>
+                    <span>Baseline: <b>{((activeData.verdict.baseline_error_rate ?? 0) * 100).toFixed(1)}% err</b></span>
+                    <span>During Chaos: <b>{((activeData.verdict.during_error_rate ?? 0) * 100).toFixed(1)}% err</b></span>
+                    <span>Recovery: <b>{((activeData.verdict.recovery_error_rate ?? 0) * 100).toFixed(1)}% err</b></span>
                   </div>
 
                   {activeData.experiment_run_id && (
@@ -568,7 +580,7 @@ export default function Pipeline() {
                       <button
                         className="btn s"
                         style={{ padding: '3px 8px', fontSize: '12px' }}
-                        onClick={() => setSelectedId(p.id)}
+                        onClick={() => navigate(`/pipeline/${encodeURIComponent(p.id)}`)}
                       >
                         Inspect
                       </button>

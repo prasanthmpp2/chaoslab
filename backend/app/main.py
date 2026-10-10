@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.api.v1 import engines, experiments, faults, health, pipeline, runs
+from app.api.v1 import engines, experiments, faults, health, pipeline, reports, runs
 from app.core.config import get_settings
 from app.core.exceptions import PlatformError
 from app.core.logging import configure_logging, get_logger
@@ -47,7 +47,7 @@ def create_app() -> FastAPI:
         return JSONResponse({"error": {"code": "internal_error", "message": "internal error"}}, status_code=500)
 
     app.include_router(health.router)
-    for r in (engines.router, experiments.router, runs.router, faults.router, pipeline.router):
+    for r in (engines.router, experiments.router, runs.router, reports.router, faults.router, pipeline.router):
         app.include_router(r)
 
     from fastapi import Depends

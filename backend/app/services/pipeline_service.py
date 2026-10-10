@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import io
-import json
 import os
 import re
 import shutil
@@ -30,7 +28,7 @@ from app.core.logging import get_logger
 from app.db.session import session_scope
 from app.engines.registry import EngineRegistry
 from app.models import ExperimentRun, PipelineExecution, ProbeResult, RunEvent
-from app.schemas.experiment import ExperimentDocument
+from app.services.experiment_definition_service import build_pipeline_experiment
 from app.services.experiment_service import ExperimentService
 from app.workers.jobs import enqueue_run
 
@@ -768,51 +766,18 @@ class PipelineService:
             elif fault_engine == "toxiproxy" and proxy_name:
                 fault_doc_params["proxy"] = proxy_name
 
-            exp_doc = {
-                "apiVersion": "chaos.example.io/v1",
-                "kind": "Experiment",
-                "metadata": {
-                    "name": f"pipe-exp-{pipeline_id[-8:]}",
-                    "description": f"CI/CD multi-service resilience test for {state['project_name']} (target: {primary_svc['name']})",
-                },
-                "spec": {
-                    "target": {
-                        "environment": "docker-test",
-                        "service": service_name,
-                    },
-                    "fault": {
-                        "engine": fault_engine,
-                        "type": fault_type,
-                        "durationSeconds": fault_duration,
-                        "parameters": fault_doc_params,
-                    },
-                    "hypothesis": {
-                        "maxErrorRate": max_error_rate,
-                        "requireRecovery": True,
-                    },
-                    "probes": [
-                        {
-                            "name": f"{primary_svc['name']}-http-probe",
-                            "type": "http",
-                            "phases": ["baseline", "during", "recovery"],
-                            "url": final_probe_url,
-                            "expectStatus": 200,
-                            "timeoutSeconds": 2.5,
-                            "intervalSeconds": 1.0,
-                            "samples": 3,
-                        }
-                    ],
-                    "safety": {
-                        "environmentAllowlist": ["docker-test"],
-                        "maxDurationSeconds": fault_duration + 60,
-                    },
-                },
-            }
-
-            normalized_definition = ExperimentDocument.model_validate(exp_doc).model_dump(by_alias=True)
-            definition_fingerprint = hashlib.sha256(
-                json.dumps(normalized_definition, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
+            normalized_definition, definition_fingerprint = build_pipeline_experiment(
+                pipeline_id=pipeline_id,
+                project_name=state["project_name"],
+                primary_service=primary_svc["name"],
+                target_service=service_name,
+                engine=fault_engine,
+                fault_type=fault_type,
+                duration_seconds=fault_duration,
+                fault_parameters=fault_doc_params,
+                max_error_rate=max_error_rate,
+                probe_url=final_probe_url,
+            )
             state["experiment_definition_sha256"] = definition_fingerprint
             _save_pipeline_state(self.s, state)
 
@@ -820,16 +785,20 @@ class PipelineService:
             with session_scope() as db:
                 exp_svc = ExperimentService(db, self.s, registry)
                 pipeline_author = f"pipeline:{pipeline_id}"
-                pipeline_approver = state.get("approved_by")
-                if not pipeline_approver:
-                    raise RuntimeError("pipeline has no recorded approver")
-                exp = exp_svc.create(exp_doc, actor=pipeline_author)
+                # Pipeline start follows the user's explicit confirmation.
+                pipeline_actor = (
+                    state.get("confirmed_by")
+                    or state.get("approved_by")
+                    or state.get("config", {}).get("requested_by")
+                    or "pipeline-system"
+                )
+                exp = exp_svc.create(normalized_definition, actor=pipeline_author)
                 exp_id = exp.id
                 state["experiment_id"] = exp_id
+                state["confirmed_by"] = pipeline_actor
                 _save_pipeline_state(self.s, state)
 
-                exp_svc.approve(exp_id, actor=pipeline_approver)
-                run = exp_svc.start_run(exp_id, actor=pipeline_approver, enqueue=enqueue_run)
+                run = exp_svc.start_run(exp_id, actor=pipeline_actor, enqueue=enqueue_run)
                 run_id = run.id
                 state["experiment_run_id"] = run_id
                 _save_pipeline_state(self.s, state)
@@ -1032,5 +1001,12 @@ class PipelineService:
 
         if failures:
             state["cleanup_errors"] = failures
+            state["status"] = "TEARDOWN_FAILED"
+            state["current_stage"] = "Pipeline teardown failed"
+        else:
+            state.pop("cleanup_errors", None)
+            state["status"] = "TORN_DOWN"
+            state["current_stage"] = "Pipeline containers removed"
+        state["updated_at"] = _utcnow_iso()
         _save_pipeline_state(self.s, state)
         return not failures

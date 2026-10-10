@@ -24,6 +24,7 @@ from app.services import metrics
 from app.services.cleanup_service import cleanup_fault, final_status
 from app.services.probe_service import ProbeService, p95, summarize
 from app.services.safety_service import check_definition
+from app.services.scorecard_service import calculate_scorecard
 
 log = get_logger(__name__)
 
@@ -44,6 +45,8 @@ class Ctx:
     abort_reason: str | None = None
     error: str | None = None
     outcome: Outcome = Outcome.PENDING
+    recovery_duration_seconds: float | None = None
+    recovered: bool | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -117,7 +120,7 @@ class Orchestrator:
     async def _execute(self, ctx: Ctx, dry_run: bool, started: float) -> None:
         doc = ctx.doc
         try:
-            ctx.target = check_definition(self.s, self.registry, doc)  # re-check at execution time
+            ctx.target = check_definition(self.s, self.registry, doc, verify_pipeline_container=True)  # re-check at execution time
             if dry_run or not self.s.execution_enabled:
                 self._dry_run(ctx)
                 return
@@ -141,6 +144,14 @@ class Orchestrator:
                            {"parameters": f.parameters})
             run.outcome = Outcome.DRY_RUN.value
             run.cleanup_status = CleanupStatus.NOT_REQUIRED.value
+            run.scorecard = calculate_scorecard(
+                dry_run=True, max_error_rate=ctx.doc.spec.hypothesis.max_error_rate,
+                cancelled=False,
+                baseline_error_rate=None, baseline_samples=0, during_error_rate=None, during_samples=0,
+                recovery_error_rate=None, recovery_samples=0, recovery_duration_seconds=None,
+                recovery_deadline_seconds=self.s.recovery_timeout_seconds, recovered=None,
+                cleanup_status=run.cleanup_status,
+            )
             repo.transition(db, run, RunStatus.SUCCEEDED, "dry run complete")
         metrics.RUNS_COMPLETED.labels(status="SUCCEEDED", outcome="DRY_RUN").inc()
 
@@ -247,9 +258,11 @@ class Orchestrator:
             if not cleanup_ok:
                 run.requires_attention = True
                 run.outcome = ctx.outcome.value if ctx.outcome != Outcome.PENDING else Outcome.ERROR.value
+                run.recovery_duration_seconds = ctx.recovery_duration_seconds
+                self._persist(db, ctx)
+                run.scorecard = self._scorecard(ctx, run.cleanup_status)
                 repo.add_event(db, run_id, "alert", "CLEANUP FAILED: manual remediation required; see /faults/active")
                 repo.transition(db, run, RunStatus.CLEANUP_FAILED, "cleanup failed")
-                self._persist(db, ctx)
                 run.error_summary = (ctx.error or "") + " Cleanup failed; faults may still be active."
                 metrics.RUNS_COMPLETED.labels(status="CLEANUP_FAILED", outcome=run.outcome).inc()
                 metrics.RUN_DURATION.observe(time.monotonic() - started)
@@ -259,13 +272,17 @@ class Orchestrator:
         recovered = True
         if ctx.fault_id and s.cleanup.verify_recovery and s.probes:
             recovered = await self._recovery_probes(ctx)
+        elif ctx.fault_id:
+            ctx.recovered = None
         with session_scope() as db:
             run = db.get(ExperimentRun, run_id)
             self._decide(ctx, recovered)
             run.outcome = ctx.outcome.value
+            run.recovery_duration_seconds = ctx.recovery_duration_seconds
             run.error_summary = ctx.error or ctx.abort_reason or ("; ".join(ctx.notes) or None)
             run.cancel_requested = run.cancel_requested or ctx.cancelled
             self._persist(db, ctx)
+            run.scorecard = self._scorecard(ctx, run.cleanup_status)
             dst = final_status(run, True)
             if ctx.abort_reason and dst == RunStatus.SUCCEEDED:
                 dst = RunStatus.ABORTED
@@ -275,15 +292,45 @@ class Orchestrator:
 
     async def _recovery_probes(self, ctx: Ctx) -> bool:
         s = ctx.doc.spec
-        deadline = time.monotonic() + self.s.recovery_timeout_seconds
+        started = time.monotonic()
+        deadline = started + self.s.recovery_timeout_seconds
         while True:
             ctx.recovery = await self.probes.collect(s.probes, "recovery", ctx.target)
             rate, _ = rates(ctx.recovery)
-            if not ctx.recovery or rate <= s.hypothesis.max_error_rate:
+            elapsed = time.monotonic() - started
+            if not ctx.recovery:
+                ctx.recovery_duration_seconds = elapsed
+                ctx.recovered = True
                 return True
+            if rate <= s.hypothesis.max_error_rate:
+                ctx.recovery_duration_seconds = elapsed
+                ctx.recovered = elapsed <= self.s.recovery_timeout_seconds
+                return ctx.recovered
             if time.monotonic() >= deadline:
+                ctx.recovery_duration_seconds = elapsed
+                ctx.recovered = False
                 return False
             await asyncio.sleep(2)
+
+    def _scorecard(self, ctx: Ctx, cleanup_status: str) -> dict:
+        baseline_rate, _ = rates(ctx.baseline)
+        during_rate, _ = rates(ctx.during)
+        recovery_rate, _ = rates(ctx.recovery)
+        return calculate_scorecard(
+            dry_run=False,
+            cancelled=ctx.cancelled,
+            max_error_rate=ctx.doc.spec.hypothesis.max_error_rate,
+            baseline_error_rate=baseline_rate if ctx.baseline else None,
+            baseline_samples=sum(len(samples) for samples in ctx.baseline.values()),
+            during_error_rate=during_rate if ctx.during else None,
+            during_samples=sum(len(samples) for samples in ctx.during.values()),
+            recovery_error_rate=recovery_rate if ctx.recovery else None,
+            recovery_samples=sum(len(samples) for samples in ctx.recovery.values()),
+            recovery_duration_seconds=ctx.recovery_duration_seconds,
+            recovery_deadline_seconds=float(self.s.recovery_timeout_seconds),
+            recovered=ctx.recovered,
+            cleanup_status=cleanup_status,
+        )
 
     def _decide(self, ctx: Ctx, recovered: bool) -> None:
         h = ctx.doc.spec.hypothesis
@@ -294,6 +341,10 @@ class Orchestrator:
             return
         if ctx.abort_reason:
             ctx.outcome = Outcome.FAILED_HYPOTHESIS
+            return
+        if h.require_recovery and not ctx.recovery:
+            ctx.outcome = Outcome.INCONCLUSIVE
+            ctx.notes.append("recovery measurements were not collected; resilience could not be verified")
             return
         failures: list[str] = []
         rate, p = rates(ctx.during)

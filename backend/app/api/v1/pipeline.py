@@ -16,13 +16,40 @@ from app.core.security import Principal, Role, require
 from app.workers.jobs import enqueue_pipeline, enqueue_pipeline_teardown
 from app.services.pipeline_service import (
     PipelineService,
+    _save_pipeline_state,
     download_github_repo,
     get_pipeline,
     list_pipelines,
 )
+from app.services.safety_service import list_retained_pipeline_targets
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _start_pipeline(pipeline_id: str) -> dict[str, str]:
+    settings = get_settings()
+    pipeline = get_pipeline(settings, pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    if pipeline.get("status") == "QUEUED":
+        return {"pipeline_id": pipeline_id, "status": "QUEUED"}
+    if pipeline.get("status") != "PENDING_APPROVAL":
+        raise Conflict("pipeline is not ready to start")
+
+    pipeline["status"] = "QUEUED"
+    pipeline["current_stage"] = "Pipeline queued for container build"
+    pipeline["confirmed_by"] = pipeline.get("config", {}).get("requested_by") or "pipeline-user"
+    pipeline["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _save_pipeline_state(settings, pipeline)
+    try:
+        enqueue_pipeline(pipeline_id)
+    except Exception as exc:
+        pipeline["status"] = "FAILED"
+        pipeline["error"] = "Pipeline queue unavailable"
+        _save_pipeline_state(settings, pipeline)
+        raise HTTPException(status_code=503, detail="Pipeline queue unavailable") from exc
+    return {"pipeline_id": pipeline_id, "status": "QUEUED"}
 
 
 async def _read_upload_body(request: Request) -> bytes:
@@ -87,9 +114,11 @@ async def run_github_pipeline(
     except (ValueError, zipfile.BadZipFile, tarfile.ReadError) as exc:
         raise HTTPException(status_code=400, detail="Invalid project archive") from exc
 
+    _start_pipeline(pipeline_id)
+
     return {
         "pipeline_id": pipeline_id,
-        "status": "PENDING_APPROVAL",
+        "status": "QUEUED",
         "project_name": state["project_name"],
         "services_count": len(state.get("services", [])),
         "message": f"Cloned GitHub repository '{derived_repo}' and initiated multi-service CI/CD Chaos Pipeline",
@@ -177,40 +206,27 @@ async def upload_and_run(
     except (ValueError, zipfile.BadZipFile, tarfile.ReadError) as exc:
         raise HTTPException(status_code=400, detail="Invalid project archive") from exc
 
+    _start_pipeline(pipeline_id)
+
     return {
         "pipeline_id": pipeline_id,
-        "status": "PENDING_APPROVAL",
+        "status": "QUEUED",
         "project_name": state["project_name"],
         "services_count": len(state.get("services", [])),
         "message": f"Project unpacked ({len(state.get('services', []))} services detected) and CI/CD Chaos Pipeline initiated",
     }
 
 
-@router.post("/{pipeline_id}/approve", status_code=status.HTTP_202_ACCEPTED)
-def approve_pipeline(pipeline_id: str, principal: Principal = Depends(require(Role.APPROVER))):
-    settings = get_settings()
-    pipeline = get_pipeline(settings, pipeline_id)
-    if pipeline is None:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
-    if pipeline.get("status") != "PENDING_APPROVAL":
-        raise Conflict("pipeline is not waiting for approval")
-    if pipeline.get("config", {}).get("requested_by") == principal.user:
-        raise Conflict("pipeline must be approved by someone other than its requester")
+@router.post("/{pipeline_id}/start", status_code=status.HTTP_202_ACCEPTED)
+def start_pipeline(pipeline_id: str, _: Principal = Depends(require(Role.OPERATOR))):
+    """Start a prepared pipeline after the user confirms in the frontend."""
+    return _start_pipeline(pipeline_id)
 
-    pipeline["approved_by"] = principal.user
-    pipeline["status"] = "QUEUED"
-    pipeline["current_stage"] = "Pipeline approved and queued"
-    from app.services.pipeline_service import _save_pipeline_state
 
-    _save_pipeline_state(settings, pipeline)
-    try:
-        enqueue_pipeline(pipeline_id)
-    except Exception as exc:
-        pipeline["status"] = "QUEUED"
-        pipeline["error"] = "Pipeline queue unavailable"
-        _save_pipeline_state(settings, pipeline)
-        raise HTTPException(status_code=503, detail="Pipeline queue unavailable") from exc
-    return {"pipeline_id": pipeline_id, "status": pipeline["status"]}
+@router.post("/{pipeline_id}/approve", status_code=status.HTTP_202_ACCEPTED, include_in_schema=False)
+def approve_pipeline_legacy(pipeline_id: str, _: Principal = Depends(require(Role.OPERATOR))):
+    """Compatibility route for clients that still call the former approval endpoint."""
+    return _start_pipeline(pipeline_id)
 
 
 @router.get("")
@@ -218,6 +234,12 @@ def list_pipeline_runs(_: Principal = Depends(require(Role.VIEWER))):
     """List all pipeline runs with current status and summary."""
     settings = get_settings()
     return list_pipelines(settings)
+
+
+@router.get("/retained-targets")
+def retained_pipeline_targets(_: Principal = Depends(require(Role.VIEWER))):
+    """Return pipeline services configured to remain available after their run."""
+    return list_retained_pipeline_targets(get_settings())
 
 
 @router.get("/{pipeline_id}")

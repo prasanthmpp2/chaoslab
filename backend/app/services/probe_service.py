@@ -38,7 +38,7 @@ def check_probe_url(settings: Settings, url: str) -> str:
     except ValueError:
         pass
     allowed = {h.lower() for h in settings.probe_allowed_hosts}
-    if host not in allowed and not host.startswith("chaos-pipe-") and not host.startswith("pipe-"):
+    if host not in allowed:
         raise SafetyViolation(f"probe host '{host}' is not in CHAOS_PROBE_ALLOWED_HOSTS")
     return host
 

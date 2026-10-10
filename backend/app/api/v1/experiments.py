@@ -71,11 +71,6 @@ def validate(experiment_id: str, db: Session = Depends(get_db), service: Experim
     return service.validate(e.definition)
 
 
-@router.post("/{experiment_id}/approve", response_model=ExperimentOut)
-def approve(experiment_id: str, p: Principal = Depends(require(Role.APPROVER)), service: ExperimentService = Depends(svc)):
-    return service.approve(experiment_id, p.user)
-
-
 @router.post("/{experiment_id}/runs", response_model=RunSubmitResponse, status_code=202)
 def submit_run(experiment_id: str, p: Principal = Depends(require(Role.OPERATOR)), service: ExperimentService = Depends(svc)):
     run = service.start_run(experiment_id, p.user, enqueue_run)

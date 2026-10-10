@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class RunStatus(StrEnum):
@@ -86,6 +86,8 @@ class RunOut(BaseModel):
     status: str
     outcome: str
     cleanup_status: str
+    recovery_duration_seconds: float | None = None
+    scorecard: dict[str, Any]
     dry_run: bool
     requested_by: str
     cancel_requested: bool
@@ -96,6 +98,24 @@ class RunOut(BaseModel):
     error_summary: str | None
     requires_attention: bool
     definition_snapshot: dict[str, Any]
+
+    @field_validator("scorecard", mode="before")
+    @classmethod
+    def _legacy_scorecard(cls, value: dict[str, Any] | None) -> dict[str, Any]:
+        if value is not None:
+            return value
+        return {
+            "version": 1,
+            "status": "NOT_SCORED",
+            "score": None,
+            "weights": {"fault_impact": 50, "recovery_speed": 30, "cleanup": 20},
+            "components": {
+                "fault_impact": {"weight": 50, "score": None},
+                "recovery_speed": {"weight": 30, "score": None},
+                "cleanup": {"weight": 20, "score": None},
+            },
+            "reasons": ["Score unavailable: this historical run has no recovery-duration evidence"],
+        }
 
 
 class EventOut(BaseModel):

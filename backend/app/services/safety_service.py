@@ -6,10 +6,11 @@ import re
 
 from app.core.config import Settings
 from app.core.exceptions import SafetyViolation
+from app.db.session import session_scope
 from app.engines.base import ResolvedTarget
 from app.engines.registry import EngineRegistry
-from app.db.session import session_scope
-from app.models import PipelineExecution
+from app.models import ExperimentRun, PipelineExecution, TargetLease
+from app.models.base import utcnow
 from app.schemas.experiment import ExperimentDocument
 from app.services.probe_service import check_probe_url
 
@@ -25,16 +26,69 @@ def _pipeline_state_for(settings: Settings, doc: ExperimentDocument) -> dict | N
     ).hexdigest()
     with session_scope() as db:
         row = db.get(PipelineExecution, f"pipe-{suffix}")
-        if row is None or row.status != "RUNNING":
+        if row is None:
             return None
         state = row.state or {}
+        running_now = row.status == "RUNNING" and state.get("status") == "RUNNING"
+        retained_after_run = (
+            row.status in {"PASSED", "FAILED", "DRY_RUN"}
+            and state.get("status") in {"PASSED", "FAILED", "DRY_RUN"}
+            and not state.get("config", {}).get("auto_cleanup", True)
+        )
+        if not (running_now or retained_after_run) or (state.get("container") or {}).get("status") != "running":
+            return None
         if (
             doc.spec.target.service == state.get("target_service_key")
-            and state.get("approved_by")
+            and (state.get("confirmed_by") or state.get("approved_by"))
             and fingerprint == state.get("experiment_definition_sha256")
         ):
             return state
     return None
+
+
+def list_retained_pipeline_targets(settings: Settings) -> list[dict]:
+    """List pipeline targets whose state records them as deliberately retained."""
+    with session_scope() as db:
+        rows = list(db.query(PipelineExecution).order_by(PipelineExecution.created_at.desc()).all())
+        active_leases = {
+            lease.target_key for lease in db.query(TargetLease).filter(TargetLease.expires_at > utcnow()).all()
+        }
+        blocked_pipeline_ids = set()
+        active_run_statuses = {"QUEUED", "RUNNING_BASELINE", "INJECTING", "OBSERVING", "ABORTING",
+                               "CLEANING_UP", "VERIFYING_RECOVERY", "CLEANUP_FAILED"}
+        for row in rows:
+            run_id = (row.state or {}).get("experiment_run_id")
+            run = db.get(ExperimentRun, run_id) if run_id else None
+            if run and (run.status in active_run_statuses or run.cleanup_status == "FAILED"):
+                blocked_pipeline_ids.add(row.id)
+    output = []
+    for row in rows:
+        state = row.state or {}
+        config = state.get("config", {})
+        container = state.get("container", {})
+        if (
+            row.status not in {"RUNNING", "PASSED", "FAILED", "DRY_RUN"}
+            or state.get("status") not in {"RUNNING", "PASSED", "FAILED", "DRY_RUN"}
+            or row.id in blocked_pipeline_ids
+            or config.get("auto_cleanup", True)
+            or container.get("status") != "running"
+            or not state.get("experiment_definition_sha256")
+            or not state.get("experiment_id")
+            or not state.get("target_service_key")
+            or f"docker-test:{state.get('target_service_key')}" in active_leases
+        ):
+            continue
+        primary = next((service for service in state.get("services", []) if service.get("primary")), {})
+        output.append({
+            "pipeline_id": state.get("id"),
+            "project_name": state.get("project_name"),
+            "experiment_id": state.get("experiment_id"),
+            "status": state.get("status"),
+            "service": state.get("target_service_key"),
+            "service_name": primary.get("name") or state.get("project_name"),
+            "container": container.get("name"),
+        })
+    return output
 
 
 def resolve_target(settings: Settings, doc: ExperimentDocument) -> ResolvedTarget:
@@ -55,6 +109,11 @@ def resolve_target(settings: Settings, doc: ExperimentDocument) -> ResolvedTarge
             k8s_labels={"pipeline": pipeline_id},
         )
 
+    if t.environment == "docker-test" and doc.metadata.name.startswith("pipe-exp-"):
+        raise SafetyViolation(
+            "pipeline-built target is stale, was cleaned up, or no longer matches its original definition; retarget it to an allowlisted service"
+        )
+
     env = settings.environments.get(t.environment)
     if env is None:
         raise SafetyViolation(f"environment '{t.environment}' is not configured/allowlisted")
@@ -66,11 +125,27 @@ def resolve_target(settings: Settings, doc: ExperimentDocument) -> ResolvedTarge
                           k8s_labels=dict(svc.k8s_labels))
 
 
-def check_definition(settings: Settings, registry: EngineRegistry, doc: ExperimentDocument) -> ResolvedTarget:
+def check_definition(settings: Settings, registry: EngineRegistry, doc: ExperimentDocument,
+                     verify_pipeline_container: bool = False) -> ResolvedTarget:
     """Full safety policy. Raises SafetyViolation/ValidationRejected before anything touches infrastructure."""
     s = doc.spec
     target = resolve_target(settings, doc)
     pipeline_state = _pipeline_state_for(settings, doc)
+    if pipeline_state is not None and verify_pipeline_container:
+        container_name = (pipeline_state.get("container") or {}).get("name")
+        pipeline_id = pipeline_state.get("id")
+        try:
+            import docker
+
+            container = docker.from_env(timeout=5).containers.get(container_name)
+            container.reload()
+            labels = container.attrs.get("Config", {}).get("Labels") or {}
+            if container.status != "running" or labels.get("chaoslab.pipeline") != pipeline_id:
+                raise SafetyViolation("retained pipeline target is no longer running")
+        except SafetyViolation:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise SafetyViolation("retained pipeline target could not be verified as running") from exc
     env = settings.environments.get(s.target.environment)
     if pipeline_state is not None:
         config = pipeline_state.get("config", {})
@@ -100,10 +175,17 @@ def check_definition(settings: Settings, registry: EngineRegistry, doc: Experime
     engine.validate_target(target)
     engine.validate_parameters(s.fault.type, s.fault.parameters, target)
     probe_settings = settings
-    if pipeline_state is not None and pipeline_state.get("config", {}).get("fault_engine") == "toxiproxy":
+    if pipeline_state is not None:
         probe_settings = settings.model_copy(deep=True)
-        if "toxiproxy" not in probe_settings.probe_allowed_hosts:
-            probe_settings.probe_allowed_hosts.append("toxiproxy")
+        known_hosts = {
+            (pipeline_state.get("container") or {}).get("name"),
+            pipeline_state.get("target_service_key"),
+        }
+        if pipeline_state.get("config", {}).get("fault_engine") == "toxiproxy":
+            known_hosts.add("toxiproxy")
+        probe_settings.probe_allowed_hosts.extend(
+            host for host in known_hosts if host and host not in probe_settings.probe_allowed_hosts
+        )
     for p in s.probes:
         if p.type == "http":
             check_probe_url(probe_settings, p.url or "")

@@ -66,6 +66,8 @@ class ExperimentRun(Base):
     status: Mapped[str] = mapped_column(String(32), default="VALIDATING")
     outcome: Mapped[str] = mapped_column(String(32), default="PENDING")
     cleanup_status: Mapped[str] = mapped_column(String(32), default="NOT_STARTED")
+    recovery_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    scorecard: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
     requested_by: Mapped[str] = mapped_column(String(128))
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.exceptions import Conflict, DependencyUnavailable, NotFound
 from app.core.security import Principal, Role, require
 from app.db.session import get_db
@@ -23,6 +27,7 @@ from app.schemas.run import (
     RunStatus,
 )
 from app.services.report_service import build_report
+from app.services.scorecard_service import not_scored
 from app.workers.jobs import enqueue_retry_cleanup
 
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
@@ -78,7 +83,9 @@ def cancel(run_id: str, db: Session = Depends(get_db), p: Principal = Depends(re
     res = db.execute(update(ExperimentRun).where(
         ExperimentRun.id == run_id, ExperimentRun.status == RunStatus.QUEUED.value).values(
         status=RunStatus.ABORTED.value, outcome=Outcome.INCONCLUSIVE.value, cancel_requested=True,
-        cleanup_status=CleanupStatus.NOT_REQUIRED.value, finished_at=utcnow()))
+        cleanup_status=CleanupStatus.NOT_REQUIRED.value,
+        scorecard=not_scored("cancelled before execution; no measurements were collected"),
+        finished_at=utcnow()))
     if res.rowcount == 1:
         from sqlalchemy import delete
 
@@ -131,6 +138,21 @@ def probes(run_id: str, db: Session = Depends(get_db), _: Principal = Depends(re
 def artifacts(run_id: str, db: Session = Depends(get_db), _: Principal = Depends(require(Role.VIEWER))):
     _run(db, run_id)
     return list(db.scalars(select(Artifact).where(Artifact.run_id == run_id)))
+
+
+@router.get("/{run_id}/artifacts/{artifact_id}/download")
+def download_artifact(run_id: str, artifact_id: str, db: Session = Depends(get_db),
+                      _: Principal = Depends(require(Role.VIEWER))):
+    _run(db, run_id)
+    artifact = db.get(Artifact, artifact_id)
+    if artifact is None or artifact.run_id != run_id:
+        raise NotFound("run artifact not found")
+    root = Path(get_settings().artifact_dir).resolve()
+    path = Path(artifact.path).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise NotFound("run artifact file is unavailable")
+    media_type = "application/json" if path.suffix.lower() == ".json" else "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=artifact.name)
 
 
 @router.get("/{run_id}/report")
