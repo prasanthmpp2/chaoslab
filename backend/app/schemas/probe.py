@@ -34,6 +34,8 @@ class ProbeSample(BaseModel):
     latency_ms: float
     detail: str = ""
     status_code: int | None = None
+    request: dict | None = None
+    response: dict | None = None
 
 
 class ProbeSummary(BaseModel):

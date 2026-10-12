@@ -3,8 +3,8 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import NotFound
-from app.models import Artifact, ExperimentRun, FaultInstance, ProbeResult, RunEvent
+from app.core.exceptions import Conflict, NotFound
+from app.models import Artifact, ExperimentRun, FaultInstance, ProbeCall, ProbeResult, RunEvent
 from app.services.scorecard_service import not_scored
 
 
@@ -14,6 +14,7 @@ def build_report(db: Session, run_id: str) -> dict:
     if run is None:
         raise NotFound(f"run {run_id} not found")
     probes = list(db.scalars(select(ProbeResult).where(ProbeResult.run_id == run_id).order_by(ProbeResult.id)))
+    calls_count = db.scalar(select(ProbeCall.id).where(ProbeCall.run_id == run_id).limit(1))
     faults = list(db.scalars(select(FaultInstance).where(FaultInstance.run_id == run_id)))
     events = list(db.scalars(select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.id)))
     arts = list(db.scalars(select(Artifact).where(Artifact.run_id == run_id)))
@@ -39,7 +40,79 @@ def build_report(db: Session, run_id: str) -> dict:
                     "expires_at": f.expires_at} for f in faults],
         "events": [{"at": e.created_at, "type": e.event_type, "message": e.message, "details": e.details} for e in events],
         "artifacts": [{"id": a.id, "name": a.name, "size_bytes": a.size_bytes, "sha256": a.sha256} for a in arts],
+        "probe_call_capture": {"source": "synthetic_http_probes", "available": calls_count is not None},
         "notes": "Outcome is stored separately from raw evidence; empty sections mean nothing was measured.",
+    }
+
+
+def list_probe_calls(db: Session, run_id: str, phase: str | None = None,
+                     limit: int = 100, after_id: int = 0) -> list[dict]:
+    run = db.get(ExperimentRun, run_id)
+    if run is None:
+        raise NotFound(f"run {run_id} not found")
+    query = select(ProbeCall).where(ProbeCall.run_id == run_id, ProbeCall.id > after_id)
+    if phase:
+        query = query.where(ProbeCall.phase == phase)
+    rows = db.scalars(query.order_by(ProbeCall.id).limit(limit))
+    return [{"id": row.id, "probe_name": row.probe_name, "phase": row.phase,
+             "captured_at": row.captured_at, "duration_ms": row.duration_ms, "ok": row.ok,
+             "request": row.request, "response": row.response} for row in rows]
+
+
+def build_run_comparison(db: Session, baseline_id: str, candidate_id: str) -> dict:
+    baseline, candidate = db.get(ExperimentRun, baseline_id), db.get(ExperimentRun, candidate_id)
+    if baseline is None:
+        raise NotFound(f"baseline run {baseline_id} not found")
+    if candidate is None:
+        raise NotFound(f"candidate run {candidate_id} not found")
+    if baseline.id == candidate.id:
+        raise Conflict("Choose two different runs to compare")
+
+    runs = [baseline, candidate]
+    all_calls = list(db.scalars(select(ProbeCall).where(
+        ProbeCall.run_id.in_([baseline.id, candidate.id])).order_by(ProbeCall.captured_at)))
+    summaries: dict[str, dict[tuple[str, str], list[ProbeCall]]] = {baseline.id: {}, candidate.id: {}}
+    for call in all_calls:
+        summaries[call.run_id].setdefault((call.probe_name, call.phase), []).append(call)
+    keys = sorted(set(summaries[baseline.id]) | set(summaries[candidate.id]))
+
+    def metrics(calls: list[ProbeCall]) -> dict:
+        latencies = sorted(c.duration_ms for c in calls if c.ok)
+        def percentile(p: float) -> float | None:
+            return round(latencies[max(0, int((len(latencies) * p + 0.999999)) - 1)], 2) if latencies else None
+        n = len(calls)
+        return {"request_count": n, "errors": sum(not c.ok for c in calls),
+                "error_rate": round(sum(not c.ok for c in calls) / n, 4) if n else None,
+                "status_codes": {str(code): sum(1 for c in calls if c.response.get("status_code") == code)
+                                 for code in sorted({c.response.get("status_code") for c in calls
+                                                     if c.response.get("status_code") is not None})},
+                "p50_ms": percentile(.50), "p95_ms": percentile(.95), "p99_ms": percentile(.99)}
+
+    comparisons = []
+    for probe, phase in keys:
+        left, right = summaries[baseline.id].get((probe, phase), []), summaries[candidate.id].get((probe, phase), [])
+        a, b = metrics(left), metrics(right)
+        comparisons.append({"probe": probe, "phase": phase, "baseline": a, "candidate": b,
+                            "delta": {key: round(b[key] - a[key], 4) if isinstance(a[key], (int, float))
+                                      and isinstance(b[key], (int, float)) else None
+                                      for key in ("request_count", "errors", "error_rate", "p50_ms", "p95_ms", "p99_ms")}})
+
+    compatible = (baseline.experiment_id == candidate.experiment_id
+                  and baseline.experiment_version == candidate.experiment_version
+                  and baseline.definition_snapshot == candidate.definition_snapshot)
+    return {
+        "compatible": compatible,
+        "compatibility_note": "Same experiment version and definition" if compatible else
+            "Runs use different experiment versions or definitions; compare cautiously",
+        "capture_scope": "HTTP requests generated by configured synthetic probes; application traffic is not captured",
+        "runs": [{"id": run.id, "experiment_id": run.experiment_id,
+                  "experiment_version": run.experiment_version, "created_at": run.created_at,
+                  "status": run.status, "outcome": run.outcome, "cleanup_status": run.cleanup_status,
+                  "recovery_duration_seconds": run.recovery_duration_seconds,
+                  "scorecard": run.scorecard,
+                  "target": run.definition_snapshot.get("spec", {}).get("target", {}),
+                  "fault": run.definition_snapshot.get("spec", {}).get("fault", {})} for run in runs],
+        "probe_metrics": comparisons,
     }
 
 

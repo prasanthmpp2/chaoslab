@@ -117,6 +117,23 @@ class ProbeResult(Base):
     created_at: Mapped[datetime] = _ts()
 
 
+class ProbeCall(Base):
+    """One synthetic HTTP probe request and its response metadata, linked to a run phase."""
+
+    __tablename__ = "probe_calls"
+    __table_args__ = (Index("ix_probe_calls_run_phase_time", "run_id", "phase", "captured_at"),)
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True,
+                                    autoincrement=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("experiment_runs.id", ondelete="CASCADE"), index=True)
+    probe_name: Mapped[str] = mapped_column(String(64))
+    phase: Mapped[str] = mapped_column(String(16))
+    captured_at: Mapped[datetime] = _ts()
+    duration_ms: Mapped[float] = mapped_column(Float)
+    ok: Mapped[bool] = mapped_column(Boolean)
+    request: Mapped[dict] = mapped_column(JSONType)
+    response: Mapped[dict] = mapped_column(JSONType)
+
+
 class RunEvent(Base):
     __tablename__ = "run_events"
     __table_args__ = (Index("ix_events_run_time", "run_id", "created_at"),)

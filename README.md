@@ -21,8 +21,6 @@ A unified Chaos Engineering platform that provides one interface for managing re
    # Start core services (API, workers, Postgres, Redis, Frontend)
    docker compose --env-file backend/.env up --build -d
 
-   # Optional: Start testbed services (Toxiproxy, Dummy Payment Service)
-   docker compose --env-file backend/.env --profile testbed up -d
    ```
 4. **Accessing the UI**:
    * Open your browser and navigate to `http://localhost:3000`
@@ -31,10 +29,10 @@ A unified Chaos Engineering platform that provides one interface for managing re
 
 * `frontend/`: Vite + React frontend application.
 * `backend/`: FastAPI application, RQ workers, and engine adapters.
-* `docker-compose.yml`: Root compose file for frontend, backend, database, workers, and optional testbed services.
+* `docker-compose.yml`: Root compose file for frontend, backend, database, workers, and Toxiproxy.
 
 Pipeline submissions pause in `PENDING_APPROVAL`. A separate approver must approve before the pipeline worker builds uploaded source and starts the experiment. Pipeline state is stored in PostgreSQL; source/build artifacts are in the shared artifacts volume. The pipeline worker mounts the Docker socket, which grants host-level Docker control, so use only with trusted projects on a disposable development host.
 
-## E2E Testing
+## Running an experiment
 
-Create a test experiment using `toxiproxy` engine, approve it, and execute it to see faults being injected into the sample `payment-service` running in the testbed network.
+Add your disposable or staging target to `CHAOS_ENVIRONMENTS` in `backend/.env`, and add its probe hostname to `CHAOS_PROBE_ALLOWED_HOSTS`. For Toxiproxy experiments, configure a proxy for that service. The platform does not start a sample application or create a sample proxy automatically.

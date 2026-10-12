@@ -14,7 +14,7 @@ from app.core.logging import bind, get_logger
 from app.db.session import session_scope
 from app.engines.base import FaultHandle, FaultSpec, NativeOutcome, ResolvedTarget
 from app.engines.registry import EngineRegistry
-from app.models import ExperimentRun, FaultInstance
+from app.models import ExperimentRun, FaultInstance, ProbeCall
 from app.models.base import utcnow
 from app.repositories import runs as repo
 from app.schemas.experiment import ExperimentDocument
@@ -164,7 +164,7 @@ class Orchestrator:
         if not health.available:
             raise RuntimeError(f"engine {adapter.name} unavailable: {health.detail}")
 
-        ctx.baseline = await self.probes.collect(s.probes, "baseline", ctx.target)
+        ctx.baseline = await self._collect_phase(ctx, "baseline")
         base_rate, base_p95 = rates(ctx.baseline)
         self._event(run_id, "baseline", f"baseline error_rate={base_rate:.3f} p95={base_p95}",
                     {"error_rate": base_rate, "p95_ms": base_p95})
@@ -213,7 +213,9 @@ class Orchestrator:
                 self._event(ctx.run_id, "cancel", "cancellation requested; stopping observation")
                 return
             for p in during:
-                ctx.during.setdefault(p.name, []).append(await self.probes.sample(p, ctx.target))
+                sample = await self.probes.sample(p, ctx.target)
+                ctx.during.setdefault(p.name, []).append(sample)
+                await self._persist_probe_call(ctx.run_id, p.name, "during", sample)
             if s.safety.abort_on_error_rate is not None:
                 total = sum(len(v) for v in ctx.during.values())
                 rate, _ = rates(ctx.during)
@@ -295,7 +297,7 @@ class Orchestrator:
         started = time.monotonic()
         deadline = started + self.s.recovery_timeout_seconds
         while True:
-            ctx.recovery = await self.probes.collect(s.probes, "recovery", ctx.target)
+            ctx.recovery = await self._collect_phase(ctx, "recovery")
             rate, _ = rates(ctx.recovery)
             elapsed = time.monotonic() - started
             if not ctx.recovery:
@@ -389,6 +391,32 @@ class Orchestrator:
         if ctx.native:
             for n, data in ctx.native.artifacts.items():
                 repo.store_artifact(db, self.s, ctx.run_id, f"native-{n}", data)
+
+    async def _collect_phase(self, ctx: Ctx, phase: str) -> dict[str, list[ProbeSample]]:
+        output: dict[str, list[ProbeSample]] = {}
+        for probe in (item for item in ctx.doc.spec.probes if phase in item.phases):
+            output[probe.name] = []
+            for index in range(probe.samples):
+                sample = await self.probes.sample(probe, ctx.target)
+                output[probe.name].append(sample)
+                await self._persist_probe_call(ctx.run_id, probe.name, phase, sample)
+                if index < probe.samples - 1:
+                    await asyncio.sleep(probe.interval_seconds)
+        return output
+
+    async def _persist_probe_call(self, run_id: str, probe_name: str, phase: str, sample: ProbeSample) -> None:
+        if sample.request is None:
+            return
+
+        def save() -> None:
+            with session_scope() as db:
+                db.add(ProbeCall(run_id=run_id, probe_name=probe_name, phase=phase,
+                                 duration_ms=sample.latency_ms, ok=sample.ok,
+                                 request=sample.request,
+                                 response=sample.response or {"status_code": sample.status_code,
+                                                              "error": sample.detail or None}))
+
+        await asyncio.to_thread(save)
 
 
 def _new_uuid() -> str:

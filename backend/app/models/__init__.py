@@ -7,6 +7,7 @@ from app.models.entities import (
     ExperimentVersion,
     FaultInstance,
     PipelineExecution,
+    ProbeCall,
     ProbeResult,
     RunEvent,
     TargetLease,
@@ -14,5 +15,5 @@ from app.models.entities import (
 
 __all__ = [
     "Base", "Artifact", "AuditLog", "Experiment", "ExperimentRun", "ExperimentVersion", "FaultInstance",
-    "ProbeResult", "PipelineExecution", "RunEvent", "TargetLease",
+    "ProbeResult", "ProbeCall", "PipelineExecution", "RunEvent", "TargetLease",
 ]

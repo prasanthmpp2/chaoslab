@@ -31,19 +31,9 @@ async def list_engines(reg: EngineRegistry = Depends(get_registry), _: Principal
         return d
 
     results = await asyncio.gather(*(_one(n) for n in reg.names()))
-    out = []
-    seen = set()
-    for item in results:
-        name = item.get("name", "")
-        if name not in seen:
-            out.append(item)
-            seen.add(name)
-        if "_" in name:
-            hyphen_name = name.replace("_", "-")
-            if hyphen_name not in seen:
-                out.append({**item, "name": hyphen_name})
-                seen.add(hyphen_name)
-    return out
+    # Registry aliases accept both separators, but the UI/API list one canonical
+    # name so underscore and hyphen spellings do not appear as duplicate engines.
+    return [{**item, "name": item.get("name", "").replace("_", "-")} for item in results]
 
 
 @router.get("/engines/{engine_name}/capabilities")

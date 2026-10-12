@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     # Probes
     probe_allowed_hosts: list[str] = Field(default_factory=list)
     probe_timeout_seconds: float = 5.0
+    capture_probe_bodies: bool = False
+    probe_body_capture_max_bytes: int = Field(default=4096, ge=0, le=65536)
     recovery_timeout_seconds: int = 60
 
     # Reliability

@@ -6,12 +6,13 @@ import math
 import socket
 import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
 from app.core.config import Settings
 from app.core.exceptions import SafetyViolation
+from app.core.security import key_is_sensitive, redact_text
 from app.engines.base import ResolvedTarget
 from app.schemas.probe import Phase, ProbeSample, ProbeSpec, ProbeSummary
 
@@ -83,15 +84,41 @@ class ProbeService:
         t0 = time.perf_counter()
         try:
             await _resolve_guard(host, u.port or (443 if u.scheme == "https" else 80))
+            response_body = bytearray()
+            body_truncated = False
             async with httpx.AsyncClient(timeout=spec.timeout_seconds, follow_redirects=False) as c:
-                r = await c.get(spec.url)
+                async with c.stream("GET", spec.url) as r:
+                    status_code = r.status_code
+                    captured_headers = {k.lower(): r.headers[k] for k in ("content-type", "content-length", "cache-control") if k in r.headers}
+                    if self.s.capture_probe_bodies and self.s.probe_body_capture_max_bytes:
+                        cap = self.s.probe_body_capture_max_bytes
+                        async for chunk in r.aiter_bytes():
+                            remaining = cap + 1 - len(response_body)
+                            response_body.extend(chunk[:remaining])
+                            if len(response_body) > cap:
+                                body_truncated = True
+                                break
             ms = (time.perf_counter() - t0) * 1000
-            return ProbeSample(ok=r.status_code == spec.expect_status, latency_ms=ms, status_code=r.status_code,
-                               detail="" if r.status_code == spec.expect_status else f"status {r.status_code}")
+            response = {"status_code": status_code, "headers": captured_headers}
+            if self.s.capture_probe_bodies and self.s.probe_body_capture_max_bytes:
+                body = bytes(response_body[:self.s.probe_body_capture_max_bytes]).decode("utf-8", errors="replace")
+                response["body"] = redact_text(body)
+                response["body_truncated"] = body_truncated
+            safe_query = urlencode([(key, "[REDACTED]" if key_is_sensitive(key) else value)
+                                    for key, value in parse_qsl(u.query, keep_blank_values=True)])
+            safe_url = urlunsplit((u.scheme, u.netloc, u.path, safe_query, ""))
+            return ProbeSample(ok=status_code == spec.expect_status, latency_ms=ms, status_code=status_code,
+                               detail="" if status_code == spec.expect_status else f"status {status_code}",
+                               request={"method": "GET", "url": safe_url}, response=response)
         except SafetyViolation as exc:
             return ProbeSample(ok=False, latency_ms=0, detail=f"blocked: {exc.message}")
         except (httpx.HTTPError, OSError) as exc:
-            return ProbeSample(ok=False, latency_ms=(time.perf_counter() - t0) * 1000, detail=type(exc).__name__)
+            return ProbeSample(ok=False, latency_ms=(time.perf_counter() - t0) * 1000,
+                               detail=type(exc).__name__, request={"method": "GET", "url": urlunsplit((
+                                   u.scheme, u.netloc, u.path,
+                                   urlencode([(key, "[REDACTED]" if key_is_sensitive(key) else value)
+                                             for key, value in parse_qsl(u.query, keep_blank_values=True)]), ""))},
+                               response={"error": type(exc).__name__})
 
     async def _container(self, spec: ProbeSpec, target: ResolvedTarget) -> ProbeSample:
         if spec.container not in target.containers:

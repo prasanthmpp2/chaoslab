@@ -114,33 +114,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     user: "0:0"
 
-  # ---- optional disposable test bed ----
+  # Toxiproxy management API is part of the core stack; it has no published host port.
   toxiproxy:
-    profiles: [testbed]
     image: ghcr.io/shopify/toxiproxy:2.9.0
     networks:
       fault-mgmt: {}
       app-net: {}
-
-  toxiproxy-init:
-    profiles: [testbed]
-    image: curlimages/curl:8.10.1
-    depends_on: [toxiproxy]
-    networks: [fault-mgmt]
-    restart: "no"
-    entrypoint: ["sh", "-c"]
-    command:
-      - >
-        until curl -sf http://toxiproxy:8474/version; do sleep 1; done;
-        curl -sf -X POST http://toxiproxy:8474/proxies
-        -d '{"name":"payment-http","listen":"0.0.0.0:8000","upstream":"payment-service:80","enabled":true}'
-        || curl -sf http://toxiproxy:8474/proxies/payment-http
-
-  payment-service:
-    profiles: [testbed]
-    image: nginx:1.27-alpine
-    container_name: payment-service
-    networks: [app-net]
 
 networks:
   api-net: {}

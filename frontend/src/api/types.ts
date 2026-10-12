@@ -130,7 +130,26 @@ export interface RunReport {
     faults: { id: string; engine: string; target_id: string; type: string; parameters: Record<string, unknown>; state: string; cleanup_error: string | null; expires_at: string }[];
     events: { at: string; type: string; message: string; details: Record<string, unknown> }[];
     artifacts: { id: string; name: string; size_bytes: number; sha256: string }[];
+    probe_call_capture?: { source: string; available: boolean };
     notes: string;
+}
+export interface ProbeCall {
+    id: number; probe_name: string; phase: string; captured_at: string; duration_ms: number; ok: boolean;
+    request: { method?: string; url?: string; [key: string]: unknown };
+    response: { status_code?: number; headers?: Record<string, string>; body?: string; body_truncated?: boolean; error?: string };
+}
+export interface RunComparisonMetric {
+    probe: string; phase: string;
+    baseline: { request_count: number; errors: number; error_rate: number | null; status_codes: Record<string, number>; p50_ms: number | null; p95_ms: number | null; p99_ms: number | null };
+    candidate: { request_count: number; errors: number; error_rate: number | null; status_codes: Record<string, number>; p50_ms: number | null; p95_ms: number | null; p99_ms: number | null };
+    delta: Record<string, number | null>;
+}
+export interface RunComparison {
+    compatible: boolean; compatibility_note: string; capture_scope: string;
+    runs: { id: string; experiment_id: string; experiment_version: number; created_at: string; status: ExecutionStatus;
+        outcome: Outcome; cleanup_status: CleanupStatus; recovery_duration_seconds: number | null; scorecard: RecoveryScorecard | null;
+        target: Target; fault: FaultDef }[];
+    probe_metrics: RunComparisonMetric[];
 }
 
 export interface PipelineSummary {

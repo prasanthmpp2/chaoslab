@@ -1,4 +1,4 @@
-import {useMutation,useQuery,useQueryClient} from '@tanstack/react-query';
+import {useInfiniteQuery,useMutation,useQuery,useQueryClient} from '@tanstack/react-query';
 import {api} from './client';import type * as T from './types';
 const V='/api/v1';const ACTIVE=['QUEUED','VALIDATING','RUNNING_BASELINE','INJECTING','OBSERVING','ABORTING','CLEANING_UP','VERIFYING_RECOVERY'];
 export const useEngines=()=>useQuery({queryKey:['engines'],queryFn:({signal})=>api<T.Engine[]>(`${V}/engines`,{signal})});
@@ -20,4 +20,6 @@ export const usePipelines=()=>useQuery({queryKey:['pipelines'],queryFn:({signal}
 export const usePipeline=(id:string)=>useQuery({queryKey:['pipeline',id],queryFn:({signal})=>api<T.PipelineDetail>(`${V}/pipeline/${id}`,{signal}),enabled:!!id,refetchInterval:q=>{const s=q.state.data?.status;return(s==='QUEUED'||s==='RUNNING'||s==='TEARING_DOWN')?1500:false}});
 export const useRetainedPipelineTargets=()=>useQuery({queryKey:['retained-pipeline-targets'],queryFn:({signal})=>api<T.RetainedPipelineTarget[]>(`${V}/pipeline/retained-targets`,{signal}),refetchInterval:10000});
 export const useRecoveryScorecardReport=(experimentId:string)=>useQuery({queryKey:['scorecard-report',experimentId],queryFn:({signal})=>api<T.ScorecardReport>(`${V}/reports/recovery-scorecard?experiment_id=${encodeURIComponent(experimentId)}`,{signal}),enabled:!!experimentId});
+export const useRunComparison=(baselineId:string,candidateId:string)=>useQuery({queryKey:['run-comparison',baselineId,candidateId],queryFn:({signal})=>api<T.RunComparison>(`${V}/reports/compare?baseline_run_id=${encodeURIComponent(baselineId)}&candidate_run_id=${encodeURIComponent(candidateId)}`,{signal}),enabled:!!baselineId&&!!candidateId&&baselineId!==candidateId});
+export const useProbeCalls=(id:string)=>useInfiniteQuery({queryKey:['probe-calls',id],initialPageParam:0,queryFn:({signal,pageParam})=>api<T.ProbeCall[]>(`${V}/runs/${id}/probe-calls?limit=500&after_id=${pageParam}`,{signal}),getNextPageParam:(last)=>last.length===500?last[last.length-1].id:undefined,enabled:!!id});
 

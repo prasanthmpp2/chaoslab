@@ -34,6 +34,70 @@ const schema = z.object({
 type FormValues = z.infer<typeof schema>;
 type TargetMode = 'retarget' | 'retained';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readExperimentDocument(value: unknown): ExperimentDocument {
+  if (!isRecord(value)) {
+    throw new Error('Expected a JSON object containing a ChaosLab experiment definition.');
+  }
+
+  // Accept both the portable definition file and an Experiment API response,
+  // which wraps the same document in a `definition` property.
+  let candidate: unknown = value;
+  if (isRecord(value.definition)) candidate = value.definition;
+  else if (isRecord(value.experiment) && isRecord(value.experiment.definition)) {
+    candidate = value.experiment.definition;
+  }
+
+  if (!isRecord(candidate)) {
+    throw new Error('No experiment definition was found. Import experiment.json or an experiment API response.');
+  }
+  if (candidate.apiVersion === 'chaos.example.io/v1' && candidate.kind === 'Experiment') {
+    if (!isRecord(candidate.metadata) || typeof candidate.metadata.name !== 'string') {
+      throw new Error('The experiment definition is missing metadata.name.');
+    }
+    if (!isRecord(candidate.spec) || !isRecord(candidate.spec.target) || !isRecord(candidate.spec.fault)) {
+      throw new Error('The experiment definition must include spec.target and spec.fault.');
+    }
+    return candidate as unknown as ExperimentDocument;
+  }
+
+  // Native Chaos Toolkit experiment files use `title`, `method`, and
+  // `steady-state-hypothesis` instead of ChaosLab's apiVersion/kind wrapper.
+  const hasNativeShape = typeof candidate.title === 'string'
+    && (Array.isArray(candidate.method) || Array.isArray(candidate.rollbacks)
+      || isRecord(candidate['steady-state-hypothesis']) || isRecord(candidate.steady_state_hypothesis));
+  if (hasNativeShape) {
+    const nativeName = slug(candidate.title as string);
+    return {
+      apiVersion: 'chaos.example.io/v1',
+      kind: 'Experiment',
+      metadata: {
+        name: nativeName,
+        version: '1',
+        description: typeof candidate.description === 'string' ? candidate.description : '',
+        tags: Array.isArray(candidate.tags) ? candidate.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+      },
+      spec: {
+        target: { environment: '', service: '' },
+        fault: { engine: 'chaos_toolkit', type: 'native-experiment', parameters: { native: candidate }, durationSeconds: 60 },
+        hypothesis: { maxErrorRate: 0.05, requireRecovery: true },
+        safety: { environmentAllowlist: [], maxDurationSeconds: 3600 },
+        cleanup: { removeFaults: true, verifyRecovery: true },
+        probes: [],
+        limits: { runTimeoutSeconds: 300 },
+      },
+    };
+  }
+
+  if (candidate.apiVersion !== 'chaos.example.io/v1' || candidate.kind !== 'Experiment') {
+    throw new Error('Unsupported definition format. Expected apiVersion "chaos.example.io/v1" and kind "Experiment".');
+  }
+  throw new Error('The experiment definition must include metadata.name, spec.target, and spec.fault.');
+}
+
 const STEPS = ['Basics', 'Target', 'Engine', 'Fault', 'Probes & hypothesis', 'Review'];
 const FIELDS: (keyof FormValues)[][] = [
   ['name'], ['environment_id', 'target'], ['engine'],
@@ -41,11 +105,11 @@ const FIELDS: (keyof FormValues)[][] = [
   ['max_error_rate', 'probes_json'], [],
 ];
 const DEFAULT_PARAMS: Record<string, Record<string, unknown>> = {
-  'network-latency': { proxy: 'payment-http', latencyMs: 100, jitterMs: 0 },
-  'bandwidth-limit': { proxy: 'payment-http', rateKbps: 1024 },
-  'connection-timeout': { proxy: 'payment-http', timeoutMs: 5000 },
-  'connection-reset': { proxy: 'payment-http', timeoutMs: 0 },
-  'data-limit': { proxy: 'payment-http', bytes: 1048576 },
+  'network-latency': { proxy: '', latencyMs: 100, jitterMs: 0 },
+  'bandwidth-limit': { proxy: '', rateKbps: 1024 },
+  'connection-timeout': { proxy: '', timeoutMs: 5000 },
+  'connection-reset': { proxy: '', timeoutMs: 0 },
+  'data-limit': { proxy: '', bytes: 1048576 },
   'container-kill': { signal: 'SIGKILL' },
   'container-stop': {}, 'container-pause': {},
   'network-delay': { timeMs: 100, jitterMs: 10, latencyMs: 100, mode: 'one' },
@@ -117,11 +181,7 @@ export default function NewExperiment() {
     setMessage('');
     if (!file) return;
     try {
-      const parsed = JSON.parse(await file.text()) as ExperimentDocument;
-      if (parsed?.apiVersion !== 'chaos.example.io/v1' || parsed?.kind !== 'Experiment'
-        || !parsed?.metadata?.name || !parsed?.spec?.target || !parsed?.spec?.fault) {
-        throw new Error('This file does not look like a ChaosLab Experiment JSON definition.');
-      }
+      const parsed = readExperimentDocument(JSON.parse(await file.text()));
       const pipelineDoc = parsed.spec.target.environment === 'docker-test'
         && /^pipe-exp-[a-f0-9]{8}$/.test(parsed.metadata.name);
       setSourceDoc(parsed);
@@ -303,15 +363,19 @@ export default function NewExperiment() {
         <p className="mu">The imported definition will be submitted unchanged so the backend can verify its pipeline fingerprint and live container.</p>
       </div> : <>
         <label htmlFor="environment">Environment</label>
-        <select id="environment" {...form.register('environment_id')}>
-          <option value="">Select an allowlisted environment</option>
+        <select id="environment" {...form.register('environment_id', {
+          onChange: () => form.setValue('target', '', { shouldDirty: true, shouldValidate: true }),
+        })} disabled={!environments.data?.length}>
+          <option value="">{environments.data?.length ? 'Select an allowlisted environment' : 'No allowlisted environments configured'}</option>
           {environments.data!.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.runtime})</option>)}
         </select>{fieldError('environment_id')}
         <label htmlFor="target-service">Service target</label>
-        <select id="target-service" {...form.register('target')}>
-          <option value="">Select a service</option>{environment?.targets.map((target) => <option key={target} value={target}>{target}</option>)}
+        <select id="target-service" {...form.register('target')} disabled={!environment || !environment.targets.length}>
+          <option value="">{!environment ? 'Select an environment first' : environment.targets.length ? 'Select a service' : 'No services allowlisted in this environment'}</option>
+          {environment?.targets.map((target) => <option key={target} value={target}>{target}</option>)}
         </select>{fieldError('target')}
-        {sourceDoc && <div className="review-box"><b>Imported target (reference only)</b><p>{sourceDoc.spec.target.environment}:{sourceDoc.spec.target.service}</p><p>The experiment will use the allowlisted target selected above.</p></div>}
+        {sourceDoc && (sourceDoc.spec.target.environment || sourceDoc.spec.target.service) && <div className="review-box"><b>Imported target (reference only)</b><p>{sourceDoc.spec.target.environment || '—'}:{sourceDoc.spec.target.service || '—'}</p><p>The experiment will use the allowlisted target selected above.</p></div>}
+        {sourceDoc && !sourceDoc.spec.target.environment && !sourceDoc.spec.target.service && <p className="mu">This native experiment does not specify a ChaosLab target. Select an allowlisted environment and service above.</p>}
       </>)}
       {step === 2 && <div className="g2">{engines.data!.map((item) => {
         const configured = item.configured ?? item.enabled ?? false;
@@ -319,8 +383,9 @@ export default function NewExperiment() {
         const allowed = (environment?.engines ?? []).flatMap((value) => [value, value.replace('_', '-'), value.replace('-', '_')]);
         const selectable = isRetained || (configured && reachable && (!environment || allowed.includes(item.name)));
         return <button type="button" key={item.name} disabled={!selectable || isRetained} className={`eng ${values.engine === item.name || values.engine === item.name.replace('_', '-') ? 'sel' : ''}`} onClick={() => {
+          const sameEngine = values.engine === item.name;
           form.setValue('engine', item.name);
-          if (item.capabilities[0]) onFaultChange(item.capabilities[0], item.name);
+          if (!sameEngine && item.capabilities[0]) onFaultChange(item.capabilities[0], item.name);
         }}><b>{item.name}</b><div className="mu">{selectable ? `Capabilities: ${item.capabilities.join(', ')}` : 'Not configured, reachable, or enabled for this environment.'}</div></button>;
       })}{fieldError('engine')}</div>}
       {step === 3 && <>
@@ -330,6 +395,7 @@ export default function NewExperiment() {
         </select>{fieldError('fault_type')}
         <label htmlFor="fault-duration">Duration (seconds)</label><input id="fault-duration" type="number" {...form.register('duration_seconds')} disabled={isRetained} />{fieldError('duration_seconds')}
         <label htmlFor="fault-parameters">Fault parameters (JSON)</label><textarea id="fault-parameters" rows={5} {...form.register('parameters_json')} disabled={isRetained} />{fieldError('parameters_json')}
+        {values.engine === 'toxiproxy' && <p className="mu">Enter the name of a Toxiproxy proxy configured for your selected service. The platform does not create a sample proxy.</p>}
       </>}
       {step === 4 && <>
         <label htmlFor="error-tolerance">Maximum error rate during fault (%)</label><input id="error-tolerance" type="number" {...form.register('max_error_rate')} disabled={isRetained} />{fieldError('max_error_rate')}

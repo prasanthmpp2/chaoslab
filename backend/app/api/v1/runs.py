@@ -26,7 +26,7 @@ from app.schemas.run import (
     RunOut,
     RunStatus,
 )
-from app.services.report_service import build_report
+from app.services.report_service import build_report, list_probe_calls
 from app.services.scorecard_service import not_scored
 from app.workers.jobs import enqueue_retry_cleanup
 
@@ -158,3 +158,10 @@ def download_artifact(run_id: str, artifact_id: str, db: Session = Depends(get_d
 @router.get("/{run_id}/report")
 def report(run_id: str, db: Session = Depends(get_db), _: Principal = Depends(require(Role.VIEWER))):
     return build_report(db, run_id)
+
+
+@router.get("/{run_id}/probe-calls")
+def probe_calls(run_id: str, phase: str | None = Query(default=None, pattern="^(baseline|during|recovery)$"),
+                limit: int = Query(100, ge=1, le=500), after_id: int = Query(0, ge=0),
+                db: Session = Depends(get_db), _: Principal = Depends(require(Role.VIEWER))):
+    return list_probe_calls(db, run_id, phase=phase, limit=limit, after_id=after_id)
